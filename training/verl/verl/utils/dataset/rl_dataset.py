@@ -59,13 +59,35 @@ def _load_parquet_dataset(parquet_file: str) -> datasets.Dataset:
     payloads) are stored as chunked arrays that pyarrow cannot convert.
     """
     import pyarrow.parquet as pq
+    import pyarrow as pa
 
     try:
         rows: list[dict] = []
         parquet_reader = pq.ParquetFile(parquet_file)
         for batch in parquet_reader.iter_batches(batch_size=_PARQUET_READ_BATCH_ROWS):
             rows.extend(batch.to_pylist())
-        return datasets.Dataset.from_list(rows)
+
+        def to_large(t):
+            if pa.types.is_string(t):
+                return pa.large_string()
+            if pa.types.is_binary(t):
+                return pa.large_binary()
+            if pa.types.is_list(t) or pa.types.is_large_list(t):
+                return pa.large_list(t.value_field.with_type(to_large(t.value_type)))
+            if pa.types.is_fixed_size_list(t):
+                return pa.list_(
+                    t.value_field.with_type(to_large(t.value_type)), t.list_size
+                )
+            if pa.types.is_struct(t):
+                return pa.struct([f.with_type(to_large(f.type)) for f in t])
+            return t
+
+        schema = pa.schema([
+            f.with_type(to_large(f.type))
+            for f in parquet_reader.schema_arrow
+        ])
+        return datasets.Dataset(pa.Table.from_pylist(rows, schema=schema))
+    
     except Exception as exc:
         exc_name = type(exc).__name__
         exc_text = str(exc)
