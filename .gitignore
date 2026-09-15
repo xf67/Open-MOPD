@@ -36,3 +36,6 @@ experiments/20260527_021546
 
 # Local open-source staging area (35 G of weights + data); never commit.
 ms_sync/
+outputs/
+output/
+logs/
