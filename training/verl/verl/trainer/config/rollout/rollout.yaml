@@ -271,6 +271,10 @@ update_weights_bucket_megabytes: 512
 # a diagnostic safety gate and stays disabled in normal training.
 verify_weight_sync: False
 
+# Single-GPU only: make the actor and vLLM rollout alias the same parameter
+# storage. Enabling this forces a one-to-one, same-dtype, eager vLLM layout.
+share_weights: False
+
 # Diagnostic-only: preserve checkpoint-preloaded vLLM weights for the first
 # rollout transition so actor refit can be isolated from checkpoint loading.
 skip_initial_weight_sync: False

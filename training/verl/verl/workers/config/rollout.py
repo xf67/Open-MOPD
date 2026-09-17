@@ -184,6 +184,10 @@ class RolloutConfig(BaseConfig):
     # and after vLLM load_weights and a mismatch fails the run immediately.
     verify_weight_sync: bool = False
 
+    # Single-GPU only: alias vLLM parameters to the actor's CUDA storage so
+    # optimizer updates are visible without actor -> rollout weight copies.
+    share_weights: bool = False
+
     # Diagnostic-only switch for a preloaded vLLM engine.  It leaves the
     # checkpoint-loaded weights untouched for the first rollout transition,
     # allowing validation to distinguish checkpoint loading from the online

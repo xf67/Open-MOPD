@@ -27,13 +27,14 @@ When working with Megatron:
 """
 
 import asyncio
+import gc
 import getpass
 import inspect
 import logging
 import os
 import pickle
 import time
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
 from dataclasses import asdict
 from types import MethodType
 from typing import Any, Generator
@@ -82,6 +83,11 @@ from verl.utils.vllm import TensorLoRARequest, VLLMHijack, is_version_ge
 from verl.workers.config import HFModelConfig, RolloutConfig
 from verl.workers.rollout.base import BaseRollout
 from verl.workers.rollout.seed import ranked_rollout_seed
+from verl.workers.rollout.shared_weights import (
+    SharedWeightBinding,
+    bind_shared_weights,
+    validate_shared_weights as validate_shared_weight_bindings,
+)
 from verl.workers.rollout.utils import get_free_port, is_valid_ipv6_address
 from verl.workers.rollout.vllm_rollout.utils import (
     VLLM_LORA_INT_ID,
@@ -308,6 +314,52 @@ def _check_vllm_version_for_sleep_level():
     return vs.parse(current_version) >= vs.parse(minver)
 
 
+@contextmanager
+def _use_default_allocator_for_vllm_weights(enabled: bool):
+    """Keep shared-mode dummy weights out of vLLM's sleep allocator."""
+    if not enabled:
+        yield
+        return
+
+    worker_classes = []
+    try:
+        from vllm.v1.worker.gpu_worker import Worker as V1Worker
+
+        worker_classes.append(V1Worker)
+    except ImportError:
+        pass
+    try:
+        from vllm.worker.worker import Worker as V0Worker
+
+        worker_classes.append(V0Worker)
+    except ImportError:
+        pass
+
+    worker_classes = [
+        worker_class
+        for worker_class in worker_classes
+        if hasattr(worker_class, "_maybe_get_memory_pool_context")
+    ]
+    if not worker_classes:
+        raise RuntimeError("This vLLM version cannot bypass the weight memory pool for shared weights")
+
+    original_methods = {}
+    for worker_class in worker_classes:
+        original = worker_class._maybe_get_memory_pool_context
+        original_methods[worker_class] = original
+
+        def patched(worker, tag: str, _original=original):
+            return nullcontext() if tag == "weights" else _original(worker, tag)
+
+        worker_class._maybe_get_memory_pool_context = patched
+
+    try:
+        yield
+    finally:
+        for worker_class, original in original_methods.items():
+            worker_class._maybe_get_memory_pool_context = original
+
+
 class vLLMRollout(BaseRollout):
     def __init__(
         self,
@@ -316,6 +368,7 @@ class vLLMRollout(BaseRollout):
         device_mesh: DeviceMesh,
     ):
         super().__init__(config, model_config, device_mesh)
+        self._shared_weight_bindings: list[SharedWeightBinding] | None = None
 
         if config.layered_summon:
             self.sleep_level = 1
@@ -428,29 +481,30 @@ class vLLMRollout(BaseRollout):
 
         rollout_dp_rank = device_mesh["dp"].get_local_rank()
         engine_seed = ranked_rollout_seed(config.get("seed", 0), rollout_dp_rank)
-        self.inference_engine = LLM(
-            model=model_path,
-            enable_sleep_mode=config.free_cache_engine,
-            tensor_parallel_size=tensor_parallel_size,
-            distributed_executor_backend="external_launcher",
-            dtype=config.dtype,
-            enforce_eager=config.enforce_eager,
-            gpu_memory_utilization=config.gpu_memory_utilization,
-            disable_custom_all_reduce=True,
-            skip_tokenizer_init=False,
-            max_model_len=max_model_len,
-            max_num_seqs=config.max_num_seqs,
-            load_format=load_format,
-            disable_log_stats=config.disable_log_stats,
-            max_num_batched_tokens=max_num_batched_tokens,
-            enable_chunked_prefill=config.enable_chunked_prefill,
-            enable_prefix_caching=config.enable_prefix_caching,
-            trust_remote_code=trust_remote_code,
-            seed=engine_seed,
-            **compilation_config,
-            **self.lora_kwargs,
-            **engine_kwargs,
-        )
+        with _use_default_allocator_for_vllm_weights(config.share_weights):
+            self.inference_engine = LLM(
+                model=model_path,
+                enable_sleep_mode=config.free_cache_engine,
+                tensor_parallel_size=tensor_parallel_size,
+                distributed_executor_backend="external_launcher",
+                dtype=config.dtype,
+                enforce_eager=config.enforce_eager,
+                gpu_memory_utilization=config.gpu_memory_utilization,
+                disable_custom_all_reduce=True,
+                skip_tokenizer_init=False,
+                max_model_len=max_model_len,
+                max_num_seqs=config.max_num_seqs,
+                load_format=load_format,
+                disable_log_stats=config.disable_log_stats,
+                max_num_batched_tokens=max_num_batched_tokens,
+                enable_chunked_prefill=config.enable_chunked_prefill,
+                enable_prefix_caching=config.enable_prefix_caching,
+                trust_remote_code=trust_remote_code,
+                seed=engine_seed,
+                **compilation_config,
+                **self.lora_kwargs,
+                **engine_kwargs,
+            )
 
         kwargs = dict(
             n=1,
@@ -472,6 +526,39 @@ class vLLMRollout(BaseRollout):
         self.sampling_params = SamplingParams(**kwargs)
 
         self.pad_token_id = tokenizer.pad_token_id
+
+    def _get_model(self) -> torch.nn.Module:
+        return self.inference_engine.llm_engine.model_executor.driver_worker.worker.model_runner.model
+
+    def share_weights(self, actor_parameters: dict[str, torch.nn.Parameter]) -> None:
+        """Bind vLLM parameters to the colocated actor's CUDA storage."""
+        if not self.config.share_weights:
+            raise RuntimeError("share_weights() requires rollout.share_weights=True")
+
+        self._shared_weight_bindings = bind_shared_weights(self._get_model(), actor_parameters)
+
+        # Shared-mode weights deliberately use the default CUDA allocator, so
+        # dropping Parameter.data and emptying its cache safely releases the
+        # dummy vLLM copy. The KV cache remains in vLLM's sleep allocator.
+        free_before = torch.cuda.mem_get_info()[0]
+        gc.collect()
+        torch.cuda.empty_cache()
+        released_bytes = max(0, torch.cuda.mem_get_info()[0] - free_before)
+
+        self.validate_shared_weights()
+        unique_actor_parameters = {id(binding.actor): binding.actor for binding in self._shared_weight_bindings}
+        shared_bytes = sum(param.numel() * param.element_size() for param in unique_actor_parameters.values())
+        logger.warning(
+            "Sharing %d actor/vLLM parameters (%.2f GiB); released %.2f GiB of dummy vLLM storage",
+            len(unique_actor_parameters),
+            shared_bytes / 1024**3,
+            released_bytes / 1024**3,
+        )
+
+    def validate_shared_weights(self) -> None:
+        if self._shared_weight_bindings is None:
+            raise RuntimeError("vLLM shared weights have not been bound")
+        validate_shared_weight_bindings(self._shared_weight_bindings)
 
     @contextmanager
     def update_sampling_params(self, **kwargs):
@@ -695,6 +782,9 @@ class vLLMRollout(BaseRollout):
         Args:
             weights: A generator that yields the name of the weight tensor and the tensor itself.
         """
+        if self.config.share_weights:
+            raise RuntimeError("update_weights() must not be called when actor/vLLM weights are shared")
+
         peft_config, base_sync_done = kwargs.get("peft_config", None), kwargs.get("base_sync_done", False)
         if peft_config and base_sync_done:
             lora_int_id = int(time.time_ns() % 0x7FFFFFFF)
@@ -710,7 +800,7 @@ class vLLMRollout(BaseRollout):
         else:
             from verl.utils.vllm.patch import patch_vllm_moe_model_weight_loader
 
-            model = self.inference_engine.llm_engine.model_executor.driver_worker.worker.model_runner.model
+            model = self._get_model()
             patch_vllm_moe_model_weight_loader(model)
             _load_weights_with_optional_verification(
                 model,

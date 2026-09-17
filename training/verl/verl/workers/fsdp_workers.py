@@ -214,6 +214,9 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
         self._is_actor = self.role in ["actor", "actor_rollout", "actor_rollout_ref"]
         self._is_rollout = self.role in ["rollout", "actor_rollout", "actor_rollout_ref"]
         self._is_ref = self.role in ["ref", "actor_rollout_ref"]
+        self._share_rollout_weights = bool(self.config.rollout.get("share_weights", False))
+        if self._share_rollout_weights:
+            self._configure_shared_rollout_weights(world_size)
         self.use_orig_params = self.config.actor.fsdp_config.get("use_orig_params", False)
 
         # TODO(haibin.lin):
@@ -292,6 +295,60 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
         if self._is_ref and self.config.ref.log_prob_micro_batch_size is not None:
             self.config.ref.log_prob_micro_batch_size //= self.device_mesh.size() // self.ulysses_sequence_parallel_size
             self.config.ref.log_prob_micro_batch_size_per_gpu = self.config.ref.log_prob_micro_batch_size
+
+    def _configure_shared_rollout_weights(self, world_size: int) -> None:
+        """Apply and validate the deliberately narrow zero-copy configuration."""
+        if not self._is_actor or not self._is_rollout:
+            raise ValueError("rollout.share_weights requires a colocated actor_rollout worker")
+        if world_size != 1:
+            raise ValueError(f"rollout.share_weights only supports world_size=1, got {world_size}")
+        if self.config.rollout.name != "vllm" or self.config.rollout.mode != "sync":
+            raise ValueError("rollout.share_weights requires rollout.name=vllm and rollout.mode=sync")
+        if self.config.actor.strategy != "fsdp":
+            raise ValueError("rollout.share_weights currently supports the FSDP1 actor only")
+        if self._is_lora:
+            raise ValueError("rollout.share_weights does not support LoRA")
+        if self.config.actor.fsdp_config.get("param_offload", False):
+            raise ValueError("rollout.share_weights requires actor.fsdp_config.param_offload=False")
+
+        parallel_sizes = {
+            "tensor_model_parallel_size": self.config.rollout.tensor_model_parallel_size,
+            "data_parallel_size": self.config.rollout.data_parallel_size,
+            "pipeline_model_parallel_size": self.config.rollout.pipeline_model_parallel_size,
+        }
+        invalid_sizes = {name: size for name, size in parallel_sizes.items() if size != 1}
+        if invalid_sizes:
+            raise ValueError(f"rollout.share_weights requires all rollout parallel sizes to be 1: {invalid_sizes}")
+
+        actor_dtype = str(self.config.actor.fsdp_config.get("model_dtype", "fp32") or "fp32").lower()
+        dtype_aliases = {
+            "fp32": "float32",
+            "float32": "float32",
+            "torch.float32": "float32",
+            "fp16": "float16",
+            "float16": "float16",
+            "torch.float16": "float16",
+            "bf16": "bfloat16",
+            "bfloat16": "bfloat16",
+            "torch.bfloat16": "bfloat16",
+        }
+        if actor_dtype not in dtype_aliases:
+            raise ValueError(f"Unsupported actor model_dtype for shared weights: {actor_dtype}")
+
+        # FSDP1 exposes stable original-parameter views on a single rank.  vLLM
+        # must use the same dtype and eager execution because its parameters are
+        # rebound after engine construction.
+        with open_dict(self.config.actor.fsdp_config):
+            self.config.actor.fsdp_config.use_orig_params = True
+        with open_dict(self.config.rollout):
+            self.config.rollout.dtype = dtype_aliases[actor_dtype]
+            self.config.rollout.enforce_eager = True
+            self.config.rollout.load_format = "dummy"
+
+        logger.warning(
+            "Enabling single-GPU shared actor/vLLM weights: dtype=%s, use_orig_params=True, enforce_eager=True",
+            dtype_aliases[actor_dtype],
+        )
 
     def _build_model_optimizer(
         self,
@@ -647,6 +704,10 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
         self.rollout = get_rollout_class(rollout_config.name, rollout_config.mode)(
             config=rollout_config, model_config=model_config, device_mesh=rollout_device_mesh
         )
+        if self._share_rollout_weights:
+            actor_module = getattr(self.actor_module_fsdp, "_fsdp_wrapped_module", self.actor_module_fsdp)
+            actor_parameters = dict(actor_module.named_parameters(remove_duplicate=False))
+            self.rollout.share_weights(actor_parameters)
         log_gpu_memory_usage(f"After building {self.config.rollout.name} rollout", logger=logger)
 
         # Full params
@@ -664,7 +725,7 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
             )
 
         # used for LoRA
-        self.base_sync_done: bool = "dummy" not in self.config.rollout.load_format
+        self.base_sync_done: bool = self._share_rollout_weights or "dummy" not in self.config.rollout.load_format
         self._rollout_weight_sync_count = 0
         self.layered_summon = self.config.rollout.get("layered_summon", False)
 
@@ -679,6 +740,20 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
     async def rollout_mode(self):
         """Context switch hybridengine to rollout mode."""
         aggressive_empty_cache(force_sync=True)
+
+        if self._share_rollout_weights:
+            set_expandable_segments(False)
+            if self.config.rollout.free_cache_engine:
+                await self.rollout.resume(tags=["weights"])
+            self.rollout.validate_shared_weights()
+            log_gpu_memory_usage("After validating shared actor/vLLM weights", logger=logger)
+            if self.config.rollout.free_cache_engine:
+                await self.rollout.resume(tags=["kv_cache"])
+            log_gpu_memory_usage("After resume shared-weight rollout KV cache", logger=logger)
+
+            self.torch_random_states = get_torch_device().get_rng_state()
+            get_torch_device().set_rng_state(self.gen_random_states)
+            return
 
         log_gpu_memory_usage("Before load_fsdp_model_to_gpu", logger=logger)
         if self._is_offload_param:
