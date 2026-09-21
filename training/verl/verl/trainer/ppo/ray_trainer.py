@@ -1629,8 +1629,10 @@ class RayPPOTrainer:
     def _resolve_checkpoint_file(self, checkpoint_root: str, relative_path: str) -> str:
         return os.path.join(checkpoint_root, relative_path)
 
-    def _start_profiling(self, do_profile: bool) -> None:
+    def _start_profiling(self, do_profile: bool, mark_step: bool | None = None) -> None:
         """Start profiling for all worker groups if profiling is enabled."""
+        if mark_step is None:
+            mark_step = do_profile
         if do_profile:
             self.actor_rollout_wg.start_profile(role="e2e", profile_step=self.global_steps)
             if self.use_reference_policy:
@@ -1639,9 +1641,15 @@ class RayPPOTrainer:
                 self.critic_wg.start_profile(profile_step=self.global_steps)
             if self.use_rm:
                 self.rm_wg.start_profile(profile_step=self.global_steps)
+        if mark_step:
+            self.actor_rollout_wg.start_profile_step(profile_step=self.global_steps)
 
-    def _stop_profiling(self, do_profile: bool) -> None:
+    def _stop_profiling(self, do_profile: bool, mark_step: bool | None = None) -> None:
         """Stop profiling for all worker groups if profiling is enabled."""
+        if mark_step is None:
+            mark_step = do_profile
+        if mark_step:
+            self.actor_rollout_wg.stop_profile_step(drain_pending_cuda=do_profile)
         if do_profile:
             self.actor_rollout_wg.stop_profile()
             if self.use_reference_policy:
@@ -1876,7 +1884,8 @@ class RayPPOTrainer:
                     self._start_profiling(
                         not prev_step_profile and curr_step_profile
                         if self.config.global_profiler.profile_continuous_steps
-                        else curr_step_profile
+                        else curr_step_profile,
+                        mark_step=curr_step_profile,
                     )
                 batch: DataProto = DataProto.from_single_dict(batch_dict)
 
@@ -3569,7 +3578,8 @@ class RayPPOTrainer:
                     self._stop_profiling(
                         curr_step_profile and not next_step_profile
                         if self.config.global_profiler.profile_continuous_steps
-                        else curr_step_profile
+                        else curr_step_profile,
+                        mark_step=curr_step_profile,
                     )
                     prev_step_profile = curr_step_profile
                     curr_step_profile = next_step_profile

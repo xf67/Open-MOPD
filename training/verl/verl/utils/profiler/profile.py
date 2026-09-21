@@ -369,3 +369,11 @@ class DistProfilerExtension:
     def stop_profile(self) -> None:
         """Stop profiling for the current rank in the current training step."""
         self.profiler.stop()
+
+    @register(dispatch_mode=Dispatch.ONE_TO_ALL)
+    def start_profile_step(self, profile_step: int) -> None:
+        """Optional logical-step marker for a profiler capture spanning multiple steps."""
+
+    @register(dispatch_mode=Dispatch.ONE_TO_ALL)
+    def stop_profile_step(self, drain_pending_cuda: bool = False) -> None:
+        """Optional logical-step marker counterpart; specialized workers may override it."""

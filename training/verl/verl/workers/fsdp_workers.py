@@ -20,6 +20,7 @@ import json
 import logging
 import os
 import warnings
+from contextlib import contextmanager
 from dataclasses import asdict
 from typing import Any, Optional
 
@@ -96,6 +97,16 @@ logger = logging.getLogger(__file__)
 logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "WARN"))
 
 device_name = get_device_name()
+
+
+@contextmanager
+def _openmopd_nvtx(name: str):
+    """Emit lightweight phase markers without requiring the optional nvtx package."""
+    if device_name == "cuda" and torch.cuda.is_available():
+        with torch.cuda.nvtx.range(f"openmopd::{name}"):
+            yield
+    else:
+        yield
 
 
 def _compute_student_topk_in_teacher_top_p_mask(
@@ -320,34 +331,34 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
         if invalid_sizes:
             raise ValueError(f"rollout.share_weights requires all rollout parallel sizes to be 1: {invalid_sizes}")
 
-        actor_dtype = str(self.config.actor.fsdp_config.get("model_dtype", "fp32") or "fp32").lower()
-        dtype_aliases = {
-            "fp32": "float32",
-            "float32": "float32",
-            "torch.float32": "float32",
-            "fp16": "float16",
-            "float16": "float16",
-            "torch.float16": "float16",
-            "bf16": "bfloat16",
-            "bfloat16": "bfloat16",
-            "torch.bfloat16": "bfloat16",
-        }
-        if actor_dtype not in dtype_aliases:
-            raise ValueError(f"Unsupported actor model_dtype for shared weights: {actor_dtype}")
-
         # FSDP1 exposes stable original-parameter views on a single rank.  vLLM
-        # must use the same dtype and eager execution because its parameters are
-        # rebound after engine construction.
+        # must use the same BF16 dtype and eager execution because its parameters
+        # are rebound after engine construction.  BF16 also keeps vLLM on its
+        # accelerated attention path instead of the very slow FP32 fallback.
+        mixed_precision = dict(self.config.actor.fsdp_config.get("mixed_precision", None) or {})
+        mixed_precision["param_dtype"] = "bf16"
+        optimizer_impl = self.config.actor.optim.get("optimizer_impl", "torch.optim")
+        optimizer_name = self.config.actor.optim.get("optimizer", "AdamW")
+        if (optimizer_impl, optimizer_name) != ("torch.optim", "AdamW"):
+            raise ValueError(
+                "rollout.share_weights BF16 mode currently requires torch.optim.AdamW; "
+                f"got {optimizer_impl}.{optimizer_name}"
+            )
         with open_dict(self.config.actor.fsdp_config):
+            self.config.actor.fsdp_config.model_dtype = "bf16"
+            self.config.actor.fsdp_config.mixed_precision = mixed_precision
             self.config.actor.fsdp_config.use_orig_params = True
+        with open_dict(self.config.actor.optim):
+            self.config.actor.optim.optimizer_impl = "verl.utils.bf16_optimizer"
+            self.config.actor.optim.optimizer = "BF16StochasticAdamW"
         with open_dict(self.config.rollout):
-            self.config.rollout.dtype = dtype_aliases[actor_dtype]
+            self.config.rollout.dtype = "bfloat16"
             self.config.rollout.enforce_eager = True
             self.config.rollout.load_format = "dummy"
 
         logger.warning(
-            "Enabling single-GPU shared actor/vLLM weights: dtype=%s, use_orig_params=True, enforce_eager=True",
-            dtype_aliases[actor_dtype],
+            "Enabling single-GPU shared actor/vLLM weights: dtype=bfloat16, "
+            "optimizer=BF16StochasticAdamW, use_orig_params=True, enforce_eager=True"
         )
 
     def _build_model_optimizer(
@@ -739,7 +750,8 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
 
     async def rollout_mode(self):
         """Context switch hybridengine to rollout mode."""
-        aggressive_empty_cache(force_sync=True)
+        with _openmopd_nvtx("memory::empty_cache_before_rollout"):
+            aggressive_empty_cache(force_sync=True)
 
         if self._share_rollout_weights:
             set_expandable_segments(False)
@@ -757,26 +769,28 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
 
         log_gpu_memory_usage("Before load_fsdp_model_to_gpu", logger=logger)
         if self._is_offload_param:
-            load_fsdp_model_to_gpu(self.actor_module_fsdp)
+            with _openmopd_nvtx("io::h2d::actor_parameters"):
+                load_fsdp_model_to_gpu(self.actor_module_fsdp)
         log_gpu_memory_usage("After load_fsdp_model_to_gpu", logger=logger)
 
-        peft_config = None
-        peft_model = getattr(self.actor_module_fsdp, "_fsdp_wrapped_module", self.actor_module_fsdp)
-        if hasattr(peft_model, "peft_config"):  # LoRA
-            peft_config = peft_model.peft_config.get("default", None)
-            params = collect_lora_params(
-                module=self.actor_module_fsdp,
-                layered_summon=self.config.rollout.get("layered_summon", False),
-                base_sync_done=self.base_sync_done,
-            )
-            if not self.base_sync_done:
-                params = {replace_lora_wrapper(k, peft_config): v for k, v in params.items()}
-        else:
-            params = self.actor_module_fsdp.state_dict()
+        with _openmopd_nvtx("weight_sync::collect_actor_state"):
+            peft_config = None
+            peft_model = getattr(self.actor_module_fsdp, "_fsdp_wrapped_module", self.actor_module_fsdp)
+            if hasattr(peft_model, "peft_config"):  # LoRA
+                peft_config = peft_model.peft_config.get("default", None)
+                params = collect_lora_params(
+                    module=self.actor_module_fsdp,
+                    layered_summon=self.config.rollout.get("layered_summon", False),
+                    base_sync_done=self.base_sync_done,
+                )
+                if not self.base_sync_done:
+                    params = {replace_lora_wrapper(k, peft_config): v for k, v in params.items()}
+            else:
+                params = self.actor_module_fsdp.state_dict()
 
-        params = convert_weight_keys(
-            params, getattr(self.actor_module_fsdp, "_fsdp_wrapped_module", self.actor_module_fsdp)
-        )
+            params = convert_weight_keys(
+                params, getattr(self.actor_module_fsdp, "_fsdp_wrapped_module", self.actor_module_fsdp)
+            )
 
         # Special handling for LoRA with sleep_level=2:
         # When sleep_level=2, base model weights are destroyed during each sleep cycle.
@@ -795,7 +809,8 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
 
         log_gpu_memory_usage("Before offload_fsdp_model_to_cpu", logger=logger)
         if self._is_offload_param:
-            offload_fsdp_model_to_cpu(self.actor_module_fsdp)
+            with _openmopd_nvtx("io::d2h::actor_parameters"):
+                offload_fsdp_model_to_cpu(self.actor_module_fsdp)
         log_gpu_memory_usage("After offload_fsdp_model_to_cpu", logger=logger)
 
         set_expandable_segments(False)
@@ -813,7 +828,8 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
         )
 
         if self.config.rollout.free_cache_engine:
-            await self.rollout.resume(tags=["weights"])
+            with _openmopd_nvtx("memory::vllm_wake_weights"):
+                await self.rollout.resume(tags=["weights"])
         log_gpu_memory_usage("After resume weights", logger=logger)
 
         if peft_config is not None and getattr(self.rollout, "sleep_level", None) == 2:
@@ -821,7 +837,8 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
                 (name, param.to(device, non_blocking=True).full_tensor() if isinstance(param, DTensor) else param)
                 for name, param in base_model_params.items()
             )
-            await self.rollout.update_weights(per_tensor_base_params, base_sync_done=False)
+            with _openmopd_nvtx("weight_sync::actor_to_vllm_base"):
+                await self.rollout.update_weights(per_tensor_base_params, base_sync_done=False)
             del base_model_params, per_tensor_base_params
 
         skip_initial_weight_sync = bool(self.config.rollout.get("skip_initial_weight_sync", False))
@@ -833,17 +850,20 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
                 "the preloaded rollout checkpoint remains active"
             )
         else:
-            await self.rollout.update_weights(
-                per_tensor_param,
-                peft_config=peft_config,
-                base_sync_done=self.base_sync_done,
-            )
+            with _openmopd_nvtx("weight_sync::actor_to_vllm"):
+                await self.rollout.update_weights(
+                    per_tensor_param,
+                    peft_config=peft_config,
+                    base_sync_done=self.base_sync_done,
+                )
             log_gpu_memory_usage("After update_weights", logger=logger)
         self._rollout_weight_sync_count += 1
         del params, per_tensor_param
-        aggressive_empty_cache(force_sync=True)
+        with _openmopd_nvtx("memory::empty_cache_after_weight_sync"):
+            aggressive_empty_cache(force_sync=True)
         if self.config.rollout.free_cache_engine:
-            await self.rollout.resume(tags=["kv_cache"])
+            with _openmopd_nvtx("memory::vllm_wake_kv_cache"):
+                await self.rollout.resume(tags=["kv_cache"])
         log_gpu_memory_usage("After resume kv_cache", logger=logger)
 
         self.base_sync_done = True
@@ -855,13 +875,15 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
         """Context switch hybridengine to trainer mode."""
         if self.config.rollout.free_cache_engine:
             log_gpu_memory_usage("Before rollout offload", logger=logger)
-            await self.rollout.release()
+            with _openmopd_nvtx("memory::vllm_release"):
+                await self.rollout.release()
             log_gpu_memory_usage("After rollout offload", logger=logger)
 
         self.actor_module_fsdp.train()
 
         # add empty cache after each compute
-        aggressive_empty_cache(force_sync=True)
+        with _openmopd_nvtx("memory::empty_cache_after_rollout"):
+            aggressive_empty_cache(force_sync=True)
 
         set_expandable_segments(True)
 
@@ -985,11 +1007,13 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
     def update_actor(self, data: DataProto):
         assert self._is_actor
         if self._is_offload_param:
-            load_fsdp_model_to_gpu(self.actor_module_fsdp)
+            with _openmopd_nvtx("io::h2d::actor_parameters_for_update"):
+                load_fsdp_model_to_gpu(self.actor_module_fsdp)
         if self._is_offload_optimizer:
-            load_fsdp_optimizer(optimizer=self.actor_optimizer, device_id=get_device_id())
+            with _openmopd_nvtx("io::h2d::optimizer_state"):
+                load_fsdp_optimizer(optimizer=self.actor_optimizer, device_id=get_device_id())
 
-        with self.ulysses_sharding_manager:
+        with self.ulysses_sharding_manager, _openmopd_nvtx("compute::actor_update"):
             # Keep on GPU to avoid expensive CPU-GPU-CPU round trip
             # data = data.to("cpu")  # data will to device with each micro batch on actor.update_policy
 
@@ -1017,10 +1041,12 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
             # output = output.to("cpu")
 
         if self._is_offload_param:
-            offload_fsdp_model_to_cpu(self.actor_module_fsdp)
+            with _openmopd_nvtx("io::d2h::actor_parameters_after_update"):
+                offload_fsdp_model_to_cpu(self.actor_module_fsdp)
             log_gpu_memory_usage("After offload actor model during update_actor", logger=logger)
         if self._is_offload_optimizer:
-            offload_fsdp_optimizer(optimizer=self.actor_optimizer)
+            with _openmopd_nvtx("io::d2h::optimizer_state"):
+                offload_fsdp_optimizer(optimizer=self.actor_optimizer)
             log_gpu_memory_usage("After offload actor optimizer during update_actor", logger=logger)
 
         return output
@@ -1030,7 +1056,8 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
     def generate_sequences(self, prompts: DataProto):
         # Support all hardwares
         assert self._is_rollout
-        prompts = prompts.to(get_device_id())
+        with _openmopd_nvtx("io::h2d::rollout_inputs"):
+            prompts = prompts.to(get_device_id())
 
         meta_info = {
             "eos_token_id": self.generation_config.eos_token_id
@@ -1049,7 +1076,8 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
             log_gpu_memory_usage("After switch to rollout mode", logger=logger)
 
         with simple_timer("generate_sequences", timing_generate):
-            output = self.rollout.generate_sequences(prompts=prompts)
+            with _openmopd_nvtx("compute::student_rollout"):
+                output = self.rollout.generate_sequences(prompts=prompts)
 
         if self._is_actor:
             loop.run_until_complete(self.trainer_mode())
@@ -1069,10 +1097,12 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
             }
         )
         output.meta_info["timing"] = timing_generate
-        output = output.to("cpu")
+        with _openmopd_nvtx("io::d2h::rollout_outputs"):
+            output = output.to("cpu")
 
         # clear kv cache
-        get_torch_device().empty_cache()
+        with _openmopd_nvtx("memory::empty_cache_after_rollout_output"):
+            get_torch_device().empty_cache()
         return output
 
     @register(dispatch_mode=make_nd_compute_dataproto_dispatch_fn(mesh_name="actor"))
@@ -1082,7 +1112,8 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
         # which is mostly used for ref log_prob calculation
         assert self._is_actor
         if self._is_offload_param:
-            load_fsdp_model_to_gpu(self.actor_module_fsdp)
+            with _openmopd_nvtx("io::h2d::actor_parameters_for_log_prob"):
+                load_fsdp_model_to_gpu(self.actor_module_fsdp)
 
         # Support all hardwares
         from contextlib import nullcontext
@@ -1098,7 +1129,7 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
         # data.meta_info["top_p"] = 1.0
         # print("log_prob_top_k", data.meta_info["top_k"])
         # perform recompute log_prob
-        with self.ulysses_sharding_manager:
+        with self.ulysses_sharding_manager, _openmopd_nvtx("compute::student_log_prob"):
             with adapter_ctx:
                 output, entropys, topk_ids, topk_log_probs = self.actor.compute_log_prob(data=data, calculate_entropy=True)
             
@@ -1123,7 +1154,8 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
             self.actor.actor_module._handle.reshard(True)
 
         if self._is_offload_param:
-            offload_fsdp_model_to_cpu(self.actor_module_fsdp)
+            with _openmopd_nvtx("io::d2h::actor_parameters_after_log_prob"):
+                offload_fsdp_model_to_cpu(self.actor_module_fsdp)
             log_gpu_memory_usage("After offload actor model during compute_log_prob", logger=logger)
 
         return output
@@ -1345,12 +1377,42 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
 
     @register(dispatch_mode=Dispatch.ONE_TO_ALL)
     def start_profile(self, **kwargs) -> None:
-        """Start profiling for the current rank in the current training step."""
+        """Start one profiling capture, which may span consecutive steps."""
         self.profiler.start(**kwargs)
+        self._openmopd_e2e_profile_active = kwargs.get("role") == "e2e" and device_name == "cuda"
+        self._openmopd_step_range_active = False
+
+    @register(dispatch_mode=Dispatch.ONE_TO_ALL)
+    def start_profile_step(self, profile_step: int) -> None:
+        """Mark one logical step inside an active continuous capture."""
+        if not getattr(self, "_openmopd_e2e_profile_active", False):
+            return
+        if getattr(self, "_openmopd_step_range_active", False):
+            raise RuntimeError("an Open-MOPD profile step range is already active")
+        torch.cuda.nvtx.range_push(f"openmopd::step::{profile_step}")
+        self._openmopd_step_range_active = True
+
+    def _finish_profile_step(self, drain_pending_cuda: bool) -> None:
+        if not getattr(self, "_openmopd_step_range_active", False):
+            return
+        if drain_pending_cuda:
+            # Keep the final step's asynchronous offloads inside the capture,
+            # without inserting a synchronization between consecutive steps.
+            with _openmopd_nvtx("io::drain_pending_cuda"):
+                torch.cuda.synchronize()
+        torch.cuda.nvtx.range_pop()
+        self._openmopd_step_range_active = False
+
+    @register(dispatch_mode=Dispatch.ONE_TO_ALL)
+    def stop_profile_step(self, drain_pending_cuda: bool = False) -> None:
+        """Close a logical step, draining only at the end of the capture."""
+        self._finish_profile_step(drain_pending_cuda=drain_pending_cuda)
 
     @register(dispatch_mode=Dispatch.ONE_TO_ALL)
     def stop_profile(self) -> None:
-        """Stop profiling for the current rank in the current training step."""
+        """Stop the profiling capture after closing any unclosed final step."""
+        self._finish_profile_step(drain_pending_cuda=True)
+        self._openmopd_e2e_profile_active = False
         self.profiler.stop()
 
     @register(dispatch_mode=Dispatch.ONE_TO_ALL)
@@ -2742,7 +2804,8 @@ class RewardModelWorker(Worker, DistProfilerExtension):
         from verl.utils.seqlen_balancing import get_reverse_idx, rearrange_micro_batches
 
         # Support all hardwares
-        data = data.to(get_device_id())
+        with _openmopd_nvtx("io::h2d::teacher_inputs"):
+            data = data.to(get_device_id())
 
         # Get student log probabilities from trajectories
         student_logp = data.batch["old_log_probs"]  # shape: [batch, response_len]
@@ -2763,27 +2826,30 @@ class RewardModelWorker(Worker, DistProfilerExtension):
 
         response_mask = data.batch["response_mask"]  # shape: [batch, response_len]
 
-        if self._do_switch_chat_template:
-            if self.rank == 0:
-                print(f"Chat template switching is ENABLED (token-level aligned, left-padded).")
-            rm_data = self._switch_chat_template_token_level(data)
-        else:
-            rm_inputs = {
-                "input_ids": data.batch["input_ids"],
-                "attention_mask": data.batch["attention_mask"],
-                "position_ids": data.batch["position_ids"],
-                "responses": data.batch["responses"],
-            }
-            rm_data = DataProto.from_dict(rm_inputs)
+        with _openmopd_nvtx("compute::teacher_prepare_inputs"):
+            if self._do_switch_chat_template:
+                if self.rank == 0:
+                    print(f"Chat template switching is ENABLED (token-level aligned, left-padded).")
+                rm_data = self._switch_chat_template_token_level(data)
+            else:
+                rm_inputs = {
+                    "input_ids": data.batch["input_ids"],
+                    "attention_mask": data.batch["attention_mask"],
+                    "position_ids": data.batch["position_ids"],
+                    "responses": data.batch["responses"],
+                }
+                rm_data = DataProto.from_dict(rm_inputs)
 
         # Support all hardwares
-        rm_data = rm_data.to(get_device_id())
+        with _openmopd_nvtx("io::h2d::teacher_model_inputs"):
+            rm_data = rm_data.to(get_device_id())
         
         if student_top_k_ids is not None:
              rm_data.batch["student_top_k_ids"] = student_top_k_ids
 
         # perform forward computation
-        with self.ulysses_sharding_manager:
+        teacher_name = os.path.basename(str(self.config.model.path).rstrip("/"))
+        with self.ulysses_sharding_manager, _openmopd_nvtx(f"compute::teacher_forward::{teacher_name}"):
             use_dynamic_bsz = self.config.use_dynamic_bsz
             if use_dynamic_bsz:
                 max_token_len = self.config.forward_max_token_len_per_gpu * self.ulysses_sequence_parallel_size

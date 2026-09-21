@@ -535,7 +535,11 @@ class vLLMRollout(BaseRollout):
         if not self.config.share_weights:
             raise RuntimeError("share_weights() requires rollout.share_weights=True")
 
-        self._shared_weight_bindings = bind_shared_weights(self._get_model(), actor_parameters)
+        self._shared_weight_bindings = bind_shared_weights(
+            self._get_model(),
+            actor_parameters,
+            required_dtype=torch.bfloat16,
+        )
 
         # Shared-mode weights deliberately use the default CUDA allocator, so
         # dropping Parameter.data and emptying its cache safely releases the
@@ -762,19 +766,23 @@ class vLLMRollout(BaseRollout):
         if not self.config.free_cache_engine:
             return
 
-        if "tags" in inspect.signature(self.inference_engine.wake_up).parameters:
-            self.inference_engine.wake_up(tags=tags)
-        else:
-            self.inference_engine.wake_up()
+        tag_name = "+".join(tags)
+        with torch.cuda.nvtx.range(f"openmopd::memory::vllm_wake_impl::{tag_name}"):
+            if "tags" in inspect.signature(self.inference_engine.wake_up).parameters:
+                self.inference_engine.wake_up(tags=tags)
+            else:
+                self.inference_engine.wake_up()
 
     async def release(self):
         """Release weights and kv cache in GPU memory."""
-        self.inference_engine.reset_prefix_cache()
+        with torch.cuda.nvtx.range("openmopd::memory::kv_reclaim_reset_prefix"):
+            self.inference_engine.reset_prefix_cache()
 
         if not self.config.free_cache_engine:
             return
 
-        self.inference_engine.sleep(level=self.sleep_level)
+        with torch.cuda.nvtx.range(f"openmopd::memory::vllm_sleep_level_{self.sleep_level}"):
+            self.inference_engine.sleep(level=self.sleep_level)
 
     async def update_weights(self, weights: Generator[tuple[str, torch.Tensor], None, None], **kwargs):
         """Update the weights of the rollout model.
@@ -802,11 +810,12 @@ class vLLMRollout(BaseRollout):
 
             model = self._get_model()
             patch_vllm_moe_model_weight_loader(model)
-            _load_weights_with_optional_verification(
-                model,
-                weights,
-                enabled=bool(self.config.verify_weight_sync),
-            )
+            with torch.cuda.nvtx.range("openmopd::weight_sync::vllm_load_weights"):
+                _load_weights_with_optional_verification(
+                    model,
+                    weights,
+                    enabled=bool(self.config.verify_weight_sync),
+                )
 
 
 # https://github.com/vllm-project/vllm/issues/13175

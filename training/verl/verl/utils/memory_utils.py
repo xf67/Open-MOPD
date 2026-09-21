@@ -27,7 +27,7 @@ from verl.utils.device import get_torch_device, is_cuda_available
 logger = logging.getLogger(__file__)
 logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "WARN"))
 
-
+# 这个的gc collect很慢，下面注释掉了
 def aggressive_empty_cache(force_sync: bool = True, max_retries: int = 3) -> None:
     """
     More aggressive GPU memory cleanup function, tries to release PyTorch reserved
@@ -47,7 +47,7 @@ def aggressive_empty_cache(force_sync: bool = True, max_retries: int = 3) -> Non
         before_allocated = device.memory_allocated()
 
         # Run garbage collection
-        gc.collect()
+        # gc.collect()
 
         # Clear PyTorch cache
         device.empty_cache()

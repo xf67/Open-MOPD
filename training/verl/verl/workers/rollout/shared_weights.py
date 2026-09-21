@@ -31,6 +31,8 @@ def _without_fsdp_wrappers(name: str) -> str:
 def bind_shared_weights(
     rollout_model: torch.nn.Module,
     actor_parameters: dict[str, torch.nn.Parameter],
+    *,
+    required_dtype: torch.dtype | None = None,
 ) -> list[SharedWeightBinding]:
     """Make rollout parameters alias the actor's CUDA storage.
 
@@ -66,6 +68,10 @@ def bind_shared_weights(
             if actor_param.dtype != rollout_param.dtype:
                 raise RuntimeError(
                     f"Cannot share {name}: actor dtype {actor_param.dtype} != vLLM dtype {rollout_param.dtype}"
+                )
+            if required_dtype is not None and actor_param.dtype != required_dtype:
+                raise RuntimeError(
+                    f"Cannot share {name}: shared weights require {required_dtype}, got {actor_param.dtype}"
                 )
             if actor_param.device != rollout_param.device:
                 raise RuntimeError(
