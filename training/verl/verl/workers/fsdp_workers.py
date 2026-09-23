@@ -79,6 +79,7 @@ from verl.utils.fsdp_utils import (
     load_fsdp_optimizer,
     offload_fsdp_model_to_cpu,
     offload_fsdp_optimizer,
+    release_fsdp_cpu_offloaded_param_views,
     replace_lora_wrapper,
 )
 from verl.utils.import_utils import import_external_libs
@@ -2241,6 +2242,7 @@ class RewardModelWorker(Worker, DistProfilerExtension):
                     use_cache=False,
                     return_dict=self.use_fused_kernels,
                 )
+                release_fsdp_cpu_offloaded_param_views(self.reward_module)
 
                 local_entropy_rmpad = None
                 local_valid_counts = None
@@ -2478,6 +2480,7 @@ class RewardModelWorker(Worker, DistProfilerExtension):
                     use_cache=False,
                     return_dict=self.use_fused_kernels,
                 )
+                release_fsdp_cpu_offloaded_param_views(self.reward_module)
 
                 if self.use_fused_kernels and not need_logits:
                     rm_log_probs = output.log_probs[:, :-1]  # (bsz, seq_length)

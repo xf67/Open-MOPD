@@ -27,6 +27,7 @@ import torch.nn as nn
 from packaging import version
 from torch.distributed import DeviceMesh
 from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
+from torch.distributed.fsdp._common_utils import HandleTrainingState
 from torch.distributed.fsdp._runtime_utils import _lazy_init
 from torch.distributed.fsdp.wrap import size_based_auto_wrap_policy, transformer_auto_wrap_policy
 from transformers.trainer_pt_utils import get_module_class_from_name
@@ -154,6 +155,32 @@ def get_fsdp_wrap_policy(module, config=None, is_lora=False):
         auto_wrap_policy = functools.partial(_or_policy, policies=policies)
 
     return auto_wrap_policy
+
+
+def release_fsdp_cpu_offloaded_param_views(model: nn.Module):
+    """Release stale GPU parameter views after an FSDP1 inference forward.
+
+    With NO_SHARD, CPU offload, and use_orig_params=False, FSDP restores the
+    flat parameter to its CPU local shard after forward but leaves the module
+    tensor views pointing at the GPU copy. Refreshing those views releases the
+    copy, including tied parameters, without another device-to-host transfer.
+    The next FSDP forward recreates the GPU views through its normal unshard.
+
+    Call only after a no-grad forward has returned. Refreshing views while an
+    autograd graph or a forward/backward operation is in use is unsafe. Other
+    FSDP configurations, FSDP2, and unwrapped models are left alone.
+    """
+    if not isinstance(model, FSDP):
+        return
+    if torch.is_grad_enabled():
+        raise RuntimeError("Releasing FSDP parameter views requires a no-grad inference context")
+    for module in FSDP.fsdp_modules(model):
+        handle = module._handle
+        if handle is None or handle.uses_sharded_strategy or not handle._offload_params or handle._use_orig_params:
+            continue
+        if handle._training_state != HandleTrainingState.IDLE or handle.flat_param.device.type != "cpu":
+            raise RuntimeError("FSDP inference must finish CPU offloading before releasing parameter views")
+        handle._use_unsharded_views(as_params=False)
 
 
 @torch.no_grad()
