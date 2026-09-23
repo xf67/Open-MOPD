@@ -332,8 +332,8 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
             raise ValueError(f"rollout.share_weights requires all rollout parallel sizes to be 1: {invalid_sizes}")
 
         # FSDP1 exposes stable original-parameter views on a single rank.  vLLM
-        # must use the same BF16 dtype and eager execution because its parameters
-        # are rebound after engine construction.  BF16 also keeps vLLM on its
+        # must use the same BF16 dtype. Bind its parameters during model loading,
+        # before vLLM warms up or captures CUDA graphs. BF16 also keeps vLLM on its
         # accelerated attention path instead of the very slow FP32 fallback.
         mixed_precision = dict(self.config.actor.fsdp_config.get("mixed_precision", None) or {})
         mixed_precision["param_dtype"] = "bf16"
@@ -353,12 +353,12 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
             self.config.actor.optim.optimizer = "BF16StochasticAdamW"
         with open_dict(self.config.rollout):
             self.config.rollout.dtype = "bfloat16"
-            self.config.rollout.enforce_eager = True
             self.config.rollout.load_format = "dummy"
 
         logger.warning(
             "Enabling single-GPU shared actor/vLLM weights: dtype=bfloat16, "
-            "optimizer=BF16StochasticAdamW, use_orig_params=True, enforce_eager=True"
+            "optimizer=BF16StochasticAdamW, use_orig_params=True, enforce_eager=%s",
+            self.config.rollout.enforce_eager,
         )
 
     def _build_model_optimizer(
@@ -712,13 +712,13 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
 
         # 4. build rollout model
         log_gpu_memory_usage(f"Before building {self.config.rollout.name} rollout", logger=logger)
-        self.rollout = get_rollout_class(rollout_config.name, rollout_config.mode)(
-            config=rollout_config, model_config=model_config, device_mesh=rollout_device_mesh
-        )
+        rollout_kwargs = {}
         if self._share_rollout_weights:
             actor_module = getattr(self.actor_module_fsdp, "_fsdp_wrapped_module", self.actor_module_fsdp)
-            actor_parameters = dict(actor_module.named_parameters(remove_duplicate=False))
-            self.rollout.share_weights(actor_parameters)
+            rollout_kwargs["actor_parameters"] = dict(actor_module.named_parameters(remove_duplicate=False))
+        self.rollout = get_rollout_class(rollout_config.name, rollout_config.mode)(
+            config=rollout_config, model_config=model_config, device_mesh=rollout_device_mesh, **rollout_kwargs
+        )
         log_gpu_memory_usage(f"After building {self.config.rollout.name} rollout", logger=logger)
 
         # Full params

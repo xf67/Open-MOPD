@@ -22,6 +22,9 @@ class SharedWeightBinding:
     name: str
     actor: torch.nn.Parameter
     rollout: torch.nn.Parameter
+    # Retain the original storage/metadata: CUDA graphs keep these addresses,
+    # even if both Parameter objects are later rebound to another allocation.
+    bound_tensor: torch.Tensor
 
 
 def _without_fsdp_wrappers(name: str) -> str:
@@ -81,21 +84,35 @@ def bind_shared_weights(
                 raise RuntimeError(f"Cannot share non-contiguous parameter {name}")
 
             rollout_param.data = actor_param.detach()
-            bindings.append(SharedWeightBinding(name=name, actor=actor_param, rollout=rollout_param))
+            bindings.append(
+                SharedWeightBinding(
+                    name=name, actor=actor_param, rollout=rollout_param, bound_tensor=actor_param.detach()
+                )
+            )
 
     validate_shared_weights(bindings)
     return bindings
 
 
 def validate_shared_weights(bindings: list[SharedWeightBinding]) -> None:
-    """Verify that every binding still references the exact same storage."""
+    """Verify that both parameters still reference the storage used at capture."""
     for binding in bindings:
         actor = binding.actor
         rollout = binding.rollout
-        if actor.shape != rollout.shape or actor.dtype != rollout.dtype or actor.device != rollout.device:
+        bound = binding.bound_tensor
+        if any(
+            param.shape != bound.shape
+            or param.dtype != bound.dtype
+            or param.device != bound.device
+            or param.stride() != bound.stride()
+            for param in (actor, rollout)
+        ):
             raise RuntimeError(f"Shared weight metadata changed for {binding.name}")
-        if actor.data_ptr() != rollout.data_ptr() or actor.storage_offset() != rollout.storage_offset():
+        if any(
+            param.data_ptr() != bound.data_ptr() or param.storage_offset() != bound.storage_offset()
+            for param in (actor, rollout)
+        ):
             raise RuntimeError(
                 f"Shared weight storage changed for {binding.name}: "
-                f"actor_ptr={actor.data_ptr()}, rollout_ptr={rollout.data_ptr()}"
+                f"actor_ptr={actor.data_ptr()}, rollout_ptr={rollout.data_ptr()}, bound_ptr={bound.data_ptr()}"
             )

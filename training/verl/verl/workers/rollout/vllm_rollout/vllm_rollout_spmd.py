@@ -37,7 +37,7 @@ import time
 from contextlib import contextmanager, nullcontext
 from dataclasses import asdict
 from types import MethodType
-from typing import Any, Generator
+from typing import Any, Callable, Generator
 
 import numpy as np
 import ray
@@ -315,9 +315,14 @@ def _check_vllm_version_for_sleep_level():
 
 
 @contextmanager
-def _use_default_allocator_for_vllm_weights(enabled: bool):
-    """Keep shared-mode dummy weights out of vLLM's sleep allocator."""
-    if not enabled:
+def _shared_vllm_weight_loading(bind_weights: Callable[[torch.nn.Module], None] | None):
+    """Bind weights after loading, before memory profiling/compilation/graph capture.
+
+    The supported external-launcher executor loads its worker in this process.
+    Keep dummy weights out of the sleep allocator and restore both hooks even
+    when loading or binding fails. KV cache allocation retains the normal pool.
+    """
+    if bind_weights is None:
         yield
         return
 
@@ -338,26 +343,35 @@ def _use_default_allocator_for_vllm_weights(enabled: bool):
     worker_classes = [
         worker_class
         for worker_class in worker_classes
-        if hasattr(worker_class, "_maybe_get_memory_pool_context")
+        if hasattr(worker_class, "_maybe_get_memory_pool_context") and hasattr(worker_class, "load_model")
     ]
     if not worker_classes:
-        raise RuntimeError("This vLLM version cannot bypass the weight memory pool for shared weights")
+        raise RuntimeError("This vLLM version does not support binding shared weights during model loading")
 
     original_methods = {}
-    for worker_class in worker_classes:
-        original = worker_class._maybe_get_memory_pool_context
-        original_methods[worker_class] = original
-
-        def patched(worker, tag: str, _original=original):
-            return nullcontext() if tag == "weights" else _original(worker, tag)
-
-        worker_class._maybe_get_memory_pool_context = patched
-
     try:
+        for worker_class in worker_classes:
+            original_pool = worker_class._maybe_get_memory_pool_context
+            original_load = worker_class.load_model
+            original_methods[worker_class] = (original_pool, original_load)
+
+            def patched_pool(worker, tag: str, _original=original_pool):
+                return nullcontext() if tag == "weights" else _original(worker, tag)
+
+            def patched_load(worker, *args, _original=original_load, **kwargs):
+                result = _original(worker, *args, **kwargs)
+                runner = worker.model_runner
+                model = runner.get_model() if hasattr(runner, "get_model") else runner.model
+                bind_weights(model)
+                return result
+
+            worker_class._maybe_get_memory_pool_context = patched_pool
+            worker_class.load_model = patched_load
         yield
     finally:
-        for worker_class, original in original_methods.items():
-            worker_class._maybe_get_memory_pool_context = original
+        for worker_class, (original_pool, original_load) in original_methods.items():
+            worker_class._maybe_get_memory_pool_context = original_pool
+            worker_class.load_model = original_load
 
 
 class vLLMRollout(BaseRollout):
@@ -366,9 +380,13 @@ class vLLMRollout(BaseRollout):
         config: RolloutConfig,
         model_config: HFModelConfig,
         device_mesh: DeviceMesh,
+        *,
+        actor_parameters: dict[str, torch.nn.Parameter] | None = None,
     ):
         super().__init__(config, model_config, device_mesh)
         self._shared_weight_bindings: list[SharedWeightBinding] | None = None
+        if config.share_weights and actor_parameters is None:
+            raise ValueError("share_weights requires actor_parameters before vLLM engine initialization")
 
         if config.layered_summon:
             self.sleep_level = 1
@@ -481,7 +499,11 @@ class vLLMRollout(BaseRollout):
 
         rollout_dp_rank = device_mesh["dp"].get_local_rank()
         engine_seed = ranked_rollout_seed(config.get("seed", 0), rollout_dp_rank)
-        with _use_default_allocator_for_vllm_weights(config.share_weights):
+
+        def bind_loaded_weights(model):
+            self._bind_shared_weights(model, actor_parameters)
+
+        with _shared_vllm_weight_loading(bind_loaded_weights if config.share_weights else None):
             self.inference_engine = LLM(
                 model=model_path,
                 enable_sleep_mode=config.free_cache_engine,
@@ -505,6 +527,10 @@ class vLLMRollout(BaseRollout):
                 **self.lora_kwargs,
                 **engine_kwargs,
             )
+        if config.share_weights:
+            # Detect versions/executors that skipped the in-process load hook,
+            # or changed parameter storage while compiling/capturing the model.
+            self.validate_shared_weights()
 
         kwargs = dict(
             n=1,
@@ -530,13 +556,17 @@ class vLLMRollout(BaseRollout):
     def _get_model(self) -> torch.nn.Module:
         return self.inference_engine.llm_engine.model_executor.driver_worker.worker.model_runner.model
 
-    def share_weights(self, actor_parameters: dict[str, torch.nn.Parameter]) -> None:
-        """Bind vLLM parameters to the colocated actor's CUDA storage."""
+    def _bind_shared_weights(
+        self, rollout_model: torch.nn.Module, actor_parameters: dict[str, torch.nn.Parameter]
+    ) -> None:
+        """Bind once during engine initialization, before CUDA graph capture."""
         if not self.config.share_weights:
-            raise RuntimeError("share_weights() requires rollout.share_weights=True")
+            raise RuntimeError("Binding shared weights requires rollout.share_weights=True")
+        if self._shared_weight_bindings is not None:
+            raise RuntimeError("Shared weights must not be rebound after CUDA graph capture")
 
         self._shared_weight_bindings = bind_shared_weights(
-            self._get_model(),
+            rollout_model,
             actor_parameters,
             required_dtype=torch.bfloat16,
         )
@@ -553,7 +583,8 @@ class vLLMRollout(BaseRollout):
         unique_actor_parameters = {id(binding.actor): binding.actor for binding in self._shared_weight_bindings}
         shared_bytes = sum(param.numel() * param.element_size() for param in unique_actor_parameters.values())
         logger.warning(
-            "Sharing %d actor/vLLM parameters (%.2f GiB); released %.2f GiB of dummy vLLM storage",
+            "Sharing %d actor/vLLM parameters (%.2f GiB) before CUDA graph capture; "
+            "released %.2f GiB of dummy vLLM storage",
             len(unique_actor_parameters),
             shared_bytes / 1024**3,
             released_bytes / 1024**3,
