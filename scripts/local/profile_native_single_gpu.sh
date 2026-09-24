@@ -4,6 +4,12 @@ set -euo pipefail
 
 SHARE_STUDENT_WEIGHTS="${SHARE_STUDENT_WEIGHTS:-true}"
 BF16_STUDENT_WEIGHTS="${BF16_STUDENT_WEIGHTS:-true}"
+# Overlap the primary teacher (Math) with student log-prob scoring.
+TEACHER_PARAM_PREFETCH="${TEACHER_PARAM_PREFETCH:-true}"
+TEACHER_PARAM_PREFETCH_MAX_MB="${TEACHER_PARAM_PREFETCH_MAX_MB:-768}"
+TEACHER_FORWARD_OVERLAP="${TEACHER_FORWARD_OVERLAP:-true}"
+# verl defaults to one CUDA work queue, which can serialize independent streams.
+export CUDA_DEVICE_MAX_CONNECTIONS="${CUDA_DEVICE_MAX_CONNECTIONS:-8}"
 
 # share=true configures BF16 actor parameters and FP32 optimizer state in the
 # worker.  This array exposes the same training precision for non-shared runs.
@@ -39,6 +45,10 @@ if ((train_batch_size % num_gpus != 0)); then
 fi
 if ((num_gpus > 1)) && [[ "${SHARE_STUDENT_WEIGHTS}" == "true" ]]; then
   printf 'Shared actor/vLLM weights require one GPU; set SHARE_STUDENT_WEIGHTS=false for multi-GPU profiling.\n' >&2
+  exit 2
+fi
+if [[ "${TEACHER_FORWARD_OVERLAP}" == "true" ]] && ((num_gpus != 1 || train_batch_size != 1)); then
+  printf 'Teacher forward overlap requires one GPU and train batch size 1; set TEACHER_FORWARD_OVERLAP=false otherwise.\n' >&2
   exit 2
 fi
 
@@ -105,6 +115,9 @@ export PYTHONPATH="${repo_root}/training/verl"
 
 printf 'CUDA_VISIBLE_DEVICES=%s; profile steps=[%s]; raw reports=%s\n' \
   "${CUDA_VISIBLE_DEVICES}" "${profile_steps_csv}" "${raw_dir}"
+printf 'Teacher param prefetch=%s; prefetch cap=%s MiB; teacher forward overlap=%s\n' \
+  "${TEACHER_PARAM_PREFETCH}" "${TEACHER_PARAM_PREFETCH_MAX_MB}" "${TEACHER_FORWARD_OVERLAP}"
+printf 'CUDA_DEVICE_MAX_CONNECTIONS=%s\n' "${CUDA_DEVICE_MAX_CONNECTIONS}"
 # Collect completed captures even if training fails later, retaining its exit code.
 set +e
 "${python_bin}" -m verl.trainer.main_ppo \
@@ -119,6 +132,9 @@ data.truncation=error \
 actor_rollout_ref.model.path=/home/xxf/Distill/models/OPD/MixSFT \
 actor_rollout_ref.rollout.name=vllm \
 actor_rollout_ref.rollout.share_weights="${SHARE_STUDENT_WEIGHTS}" \
+actor_rollout_ref.rollout.teacher_param_prefetch="${TEACHER_PARAM_PREFETCH}" \
+actor_rollout_ref.rollout.teacher_param_prefetch_max_mb="${TEACHER_PARAM_PREFETCH_MAX_MB}" \
+actor_rollout_ref.rollout.teacher_forward_overlap="${TEACHER_FORWARD_OVERLAP}" \
 "${student_training_args[@]}" \
 +actor_rollout_ref.rollout.reward_mode=mt_opd \
 actor_rollout_ref.rollout.n=1 \
@@ -149,6 +165,7 @@ trainer.default_local_dir="${run_dir}/checkpoints" \
 trainer.project_name=OpenOPD-local \
 trainer.experiment_name=mt-opd-local \
 trainer.logger=\[\'console\'\] \
+"+ray_kwargs.ray_init.runtime_env.env_vars.CUDA_DEVICE_MAX_CONNECTIONS='${CUDA_DEVICE_MAX_CONNECTIONS}'" \
 +mt_reward_model_1.enable=True \
 +mt_reward_model_1.model.path=/home/xxf/Distill/models/OPD/Code \
 +mt_reward_model_1.model.input_tokenizer=null \
@@ -251,6 +268,8 @@ cp -f "${worker_source}" "${worker_report}"
   --output "${run_dir}/traces/worker.sqlite" "${worker_report}"
 "${python_bin}" "${repo_root}/scripts/local/analyze_nsys_memory.py" \
   "${run_dir}/traces/worker.sqlite" >"${run_dir}/memory_analysis.md"
+"${python_bin}" "${repo_root}/scripts/local/analyze_teacher_forward_overlap.py" \
+  "${run_dir}" >"${run_dir}/teacher_overlap.json"
 "${nsys_bin}" stats \
   --report nvtx_pushpop_sum,cuda_gpu_mem_time_sum,cuda_gpu_mem_size_sum,cuda_gpu_sum,cuda_api_sum \
   --format csv --output "${run_dir}/traces/worker_stats" "${worker_report}"
