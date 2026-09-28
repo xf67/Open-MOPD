@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import gc
 import os
 import tempfile
 import unittest
@@ -33,6 +34,13 @@ from verl.workers.teacher_param_prefetch import TeacherHandlePrefetch
 
 
 class TestTeacherParamPrefetch(unittest.TestCase):
+    def tearDown(self):
+        # The pre_unshard monkeypatch retains FSDP handle cycles. Collect them
+        # here so later tests can measure live CUDA allocation deltas reliably.
+        gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.synchronize()
+
     def test_lora_reference_scoring_skips_teacher_prefetch(self):
         teacher = SimpleNamespace(start_param_prefetch=Mock())
         disable_adapter = Mock(side_effect=nullcontext)

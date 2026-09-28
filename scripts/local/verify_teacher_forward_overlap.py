@@ -85,6 +85,7 @@ def main():
             worker = SimpleNamespace(
                 actor=actor, _is_actor=True, _is_offload_param=False, world_size=1,
                 ulysses_sharding_manager=nullcontext(), get_fused_worker_by_name=lambda name: teacher,
+                fused_worker_dict={'rm': teacher},
                 config=OmegaConf.create({'rollout': {
                     'teacher_forward_overlap': True, 'teacher_param_prefetch': True,
                     'teacher_param_prefetch_max_mb': 768, 'log_prob_micro_batch_size_per_gpu': 1,

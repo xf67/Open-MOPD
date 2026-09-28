@@ -70,8 +70,35 @@ def analyze(run: Path) -> list[dict]:
             and student["start"] <= a["start"] <= a["end"] <= student["end"]
         ]
         student_sync = [a for a in student_apis if a["name"].startswith("cudaStreamSynchronize")]
-        ht = [r for r in owned(teacher, copies) if r["copyKind"] == 1]
+        layer_ranges = [r for r in ranges if r["name"].startswith("openmopd::io::h2d::teacher_layer_prefetch::")]
+        layer_copies = owned(layer_ranges, copies)
+        layer_ids = {r["correlationId"] for r in layer_copies}
+        # Copies submitted inside Math's forward may load Code into released slots.
+        ht = [r for r in owned(teacher, copies) if r["copyKind"] == 1 and r["correlationId"] not in layer_ids]
         prefetch = [r for r in owned(named("io::h2d::teacher_prefetch"), copies) if r["copyKind"] == 1]
+        prefetch += [r for r in owned([n for n in layer_ranges if n["name"].split("::")[4] == "rm-Math"], copies)
+                     if r["copyKind"] == 1]
+        pipeline_names = list(dict.fromkeys(
+            r["name"].split("::")[-1] for r in ranges
+            if r["name"].startswith("openmopd::compute::teacher_layer_model_forward::")
+        ))
+        layer_pipeline = []
+        for index, target in enumerate(pipeline_names):
+            previous = pipeline_names[index - 1]
+            target_copies = [r for r in owned(
+                [n for n in layer_ranges if n["name"].split("::")[4] == target], copies
+            ) if r["copyKind"] == 1]
+            previous_kernels = owned(named(f"compute::teacher_layer_model_forward::{previous}"), kernels)
+            copy_ns = duration_ns(intervals(target_copies))
+            copy_overlap_ns = intersection_ns(intervals(target_copies), intervals(previous_kernels))
+            layer_pipeline.append({
+                "target_teacher": target, "previous_teacher": previous,
+                "htod_count": len(target_copies),
+                "htod_MiB": sum(r["bytes"] for r in target_copies) / 2**20,
+                "htod_ms": ms(copy_ns),
+                "previous_teacher_kernel_overlap_ms": ms(copy_overlap_ns),
+                "previous_teacher_kernel_overlap_percent": 100 * copy_overlap_ns / copy_ns if copy_ns else None,
+            })
         all_ht = ht + prefetch
         ht_ns = duration_ns(intervals(all_ht))
         overlap_ns = intersection_ns(intervals(all_ht), intervals(sk))
@@ -110,6 +137,7 @@ def analyze(run: Path) -> list[dict]:
             "student_streams": sorted({r["streamId"] for r in sk}),
             "teacher_streams": sorted({r["streamId"] for r in tk}),
             "contexts": sorted({r["contextId"] for r in sk + tk}),
+            "layer_pipeline": layer_pipeline,
         })
     if not results:
         raise ValueError(f"no Open-MOPD step ranges in {database}")

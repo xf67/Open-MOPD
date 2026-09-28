@@ -16,6 +16,13 @@ teacher_param_prefetch_max_mb: 768
 # Single-GPU, single-micro-batch primary teacher forward / student overlap.
 teacher_forward_overlap: false
 
+# Single-GPU MT-OPD: one shared parameter slot per matching FSDP layer.
+# Takes precedence over teacher_param_prefetch; one fixed micro-batch per scoring call.
+teacher_layer_pipeline: false
+
+# Cap on the entire persistent shared teacher parameter pool (MiB).
+teacher_layer_pipeline_max_mb: 8192
+
 # Sampling temperature for rollout.
 temperature: 1.0
 

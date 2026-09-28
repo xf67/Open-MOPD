@@ -8,6 +8,10 @@ BF16_STUDENT_WEIGHTS="${BF16_STUDENT_WEIGHTS:-true}"
 TEACHER_PARAM_PREFETCH="${TEACHER_PARAM_PREFETCH:-true}"
 TEACHER_PARAM_PREFETCH_MAX_MB="${TEACHER_PARAM_PREFETCH_MAX_MB:-768}"
 TEACHER_FORWARD_OVERLAP="${TEACHER_FORWARD_OVERLAP:-true}"
+# Share one teacher's worth of HBM slots; hand each layer from Math to Code.
+# This replaces the single-shard prefetcher when enabled.
+TEACHER_LAYER_PIPELINE="${TEACHER_LAYER_PIPELINE:-true}"
+TEACHER_LAYER_PIPELINE_MAX_MB="${TEACHER_LAYER_PIPELINE_MAX_MB:-8192}"
 # verl defaults to one CUDA work queue, which can serialize independent streams.
 export CUDA_DEVICE_MAX_CONNECTIONS="${CUDA_DEVICE_MAX_CONNECTIONS:-8}"
 
@@ -47,8 +51,13 @@ if ((num_gpus > 1)) && [[ "${SHARE_STUDENT_WEIGHTS}" == "true" ]]; then
   printf 'Shared actor/vLLM weights require one GPU; set SHARE_STUDENT_WEIGHTS=false for multi-GPU profiling.\n' >&2
   exit 2
 fi
-if [[ "${TEACHER_FORWARD_OVERLAP}" == "true" ]] && ((num_gpus != 1 || train_batch_size != 1)); then
-  printf 'Teacher forward overlap requires one GPU and train batch size 1; set TEACHER_FORWARD_OVERLAP=false otherwise.\n' >&2
+scoring_batch_size=$((train_batch_size / num_gpus))
+if [[ "${TEACHER_FORWARD_OVERLAP}" == "true" ]] && ((num_gpus != 1)); then
+  printf 'Teacher forward overlap requires one GPU; set TEACHER_FORWARD_OVERLAP=false otherwise.\n' >&2
+  exit 2
+fi
+if [[ "${TEACHER_LAYER_PIPELINE}" == "true" ]] && ((num_gpus != 1)); then
+  printf 'Teacher layer pipeline requires one GPU; set TEACHER_LAYER_PIPELINE=false otherwise.\n' >&2
   exit 2
 fi
 
@@ -118,6 +127,8 @@ printf 'CUDA_VISIBLE_DEVICES=%s; profile steps=[%s]; raw reports=%s\n' \
 printf 'Teacher param prefetch=%s; prefetch cap=%s MiB; teacher forward overlap=%s\n' \
   "${TEACHER_PARAM_PREFETCH}" "${TEACHER_PARAM_PREFETCH_MAX_MB}" "${TEACHER_FORWARD_OVERLAP}"
 printf 'CUDA_DEVICE_MAX_CONNECTIONS=%s\n' "${CUDA_DEVICE_MAX_CONNECTIONS}"
+printf 'Teacher layer pipeline=%s; shared pool cap=%s MiB\n' \
+  "${TEACHER_LAYER_PIPELINE}" "${TEACHER_LAYER_PIPELINE_MAX_MB}"
 # Collect completed captures even if training fails later, retaining its exit code.
 set +e
 "${python_bin}" -m verl.trainer.main_ppo \
@@ -135,6 +146,8 @@ actor_rollout_ref.rollout.share_weights="${SHARE_STUDENT_WEIGHTS}" \
 actor_rollout_ref.rollout.teacher_param_prefetch="${TEACHER_PARAM_PREFETCH}" \
 actor_rollout_ref.rollout.teacher_param_prefetch_max_mb="${TEACHER_PARAM_PREFETCH_MAX_MB}" \
 actor_rollout_ref.rollout.teacher_forward_overlap="${TEACHER_FORWARD_OVERLAP}" \
+actor_rollout_ref.rollout.teacher_layer_pipeline="${TEACHER_LAYER_PIPELINE}" \
+actor_rollout_ref.rollout.teacher_layer_pipeline_max_mb="${TEACHER_LAYER_PIPELINE_MAX_MB}" \
 "${student_training_args[@]}" \
 +actor_rollout_ref.rollout.reward_mode=mt_opd \
 actor_rollout_ref.rollout.n=1 \
@@ -144,11 +157,11 @@ actor_rollout_ref.actor.ppo_micro_batch_size_per_gpu=1 \
 actor_rollout_ref.actor.fsdp_config.optimizer_offload=True \
 actor_rollout_ref.actor.optim.override_optimizer_config='{foreach:false}' \
 actor_rollout_ref.rollout.tensor_model_parallel_size=1 \
-actor_rollout_ref.rollout.log_prob_micro_batch_size_per_gpu=1 \
+actor_rollout_ref.rollout.log_prob_micro_batch_size_per_gpu="${scoring_batch_size}" \
 +actor_rollout_ref.rollout.log_prob_top_k=256 \
 custom_reward_function.path=/home/xxf/Distill/Open-MOPD/training/verl/verl/utils/reward_score/opd_val_dispatch.py \
 custom_reward_function.name=reward_func \
-reward_model.micro_batch_size_per_gpu=1 \
+reward_model.micro_batch_size_per_gpu="${scoring_batch_size}" \
 reward_model.enable=True \
 reward_model.model.path=/home/xxf/Distill/models/OPD/Math \
 reward_model.model.input_tokenizer=null \

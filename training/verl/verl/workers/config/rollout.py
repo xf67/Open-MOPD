@@ -198,6 +198,11 @@ class RolloutConfig(BaseConfig):
     # Initially restricted to single-GPU, single-micro-batch MT-OPD.
     teacher_forward_overlap: bool = False
 
+    # Share one teacher's parameter capacity across all colocated MT teachers.
+    # Replaces the single-shard prefetcher; independent of forward overlap.
+    teacher_layer_pipeline: bool = False
+    teacher_layer_pipeline_max_mb: int = 8192
+
     # Diagnostic-only switch for a preloaded vLLM engine.  It leaves the
     # checkpoint-loaded weights untouched for the first rollout transition,
     # allowing validation to distinguish checkpoint loading from the online
