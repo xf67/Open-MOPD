@@ -272,6 +272,11 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
         if self._is_actor:
             self._is_offload_param = self.config.actor.fsdp_config.get("param_offload", False)
             self._is_offload_optimizer = self.config.actor.fsdp_config.get("optimizer_offload", False)
+            if self.config.actor.fsdp_config.get("optimizer_offload_per_layer", False):
+                if not self._is_offload_optimizer or self.config.actor.strategy != "fsdp":
+                    raise ValueError(
+                        "optimizer_offload_per_layer requires actor.strategy=fsdp and optimizer_offload=True"
+                    )
         elif self._is_ref:
             # TODO: it seems that manual offload is slowly than FSDP offload
             self._is_offload_param = self.config.ref.fsdp_config.get("param_offload", False)
@@ -641,6 +646,10 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
             from verl.utils.torch_functional import get_constant_schedule_with_warmup, get_cosine_schedule_with_warmup
 
             actor_optimizer = build_optimizer(actor_module_fsdp.parameters(), optim_config)
+            if fsdp_config.get("optimizer_offload_per_layer", False):
+                from verl.utils.layerwise_optimizer import LayerwiseOffloadOptimizer
+
+                actor_optimizer = LayerwiseOffloadOptimizer(actor_optimizer, actor_module_fsdp)
 
             total_steps = optim_config.get("total_training_steps", 0)
             num_warmup_steps = int(optim_config.get("lr_warmup_steps", -1))

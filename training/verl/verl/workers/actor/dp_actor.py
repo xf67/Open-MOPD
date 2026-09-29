@@ -20,6 +20,7 @@ Single Process Actor
 import logging
 import math
 import os
+from contextlib import nullcontext
 from typing import Callable
 
 import torch
@@ -51,6 +52,13 @@ __all__ = ["DataParallelPPOActor", "_compute_delta_opd_rm_scores"]
 
 logger = logging.getLogger(__file__)
 logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "WARN"))
+
+
+def _actor_update_nvtx(phase: str):
+    """Mark training phases without synchronizing CUDA or requiring the nvtx package."""
+    if get_device_name() == "cuda" and torch.cuda.is_available():
+        return torch.cuda.nvtx.range(f"openmopd::compute::actor_update::{phase}")
+    return nullcontext()
 
 
 def _align_rmpad_topk_ids_for_ulysses(
@@ -883,22 +891,26 @@ class DataParallelPPOActor(BasePPOActor):
     def _optimizer_step(self):
         assert self.config.grad_clip is not None
 
-        if isinstance(self.actor_module, FSDP):
-            grad_norm = self.actor_module.clip_grad_norm_(max_norm=self.config.grad_clip)
-        elif isinstance(self.actor_module, FSDPModule):
-            grad_norm = fsdp2_clip_grad_norm_(self.actor_module.parameters(), max_norm=self.config.grad_clip)
-        else:
-            grad_norm = torch.nn.utils.clip_grad_norm_(self.actor_module.parameters(), max_norm=self.config.grad_clip)
+        with _actor_update_nvtx("grad_clip"):
+            if isinstance(self.actor_module, FSDP):
+                grad_norm = self.actor_module.clip_grad_norm_(max_norm=self.config.grad_clip)
+            elif isinstance(self.actor_module, FSDPModule):
+                grad_norm = fsdp2_clip_grad_norm_(self.actor_module.parameters(), max_norm=self.config.grad_clip)
+            else:
+                grad_norm = torch.nn.utils.clip_grad_norm_(
+                    self.actor_module.parameters(), max_norm=self.config.grad_clip
+                )
 
-        if isinstance(grad_norm, DTensor):
-            grad_norm = grad_norm.full_tensor()
+            if isinstance(grad_norm, DTensor):
+                grad_norm = grad_norm.full_tensor()
 
         # if grad_norm is not finite, skip the update
         if not torch.isfinite(grad_norm):
             print(f"WARN: rank {torch.distributed.get_rank()} grad_norm is not finite: {grad_norm}")
             self.actor_optimizer.zero_grad()
         else:
-            self.actor_optimizer.step()
+            with _actor_update_nvtx("optimizer_step"):
+                self.actor_optimizer.step()
         return grad_norm
 
     @GPUMemoryLogger(role="dp actor", logger=logger)
@@ -1131,10 +1143,11 @@ class DataParallelPPOActor(BasePPOActor):
                         elif "student_top_k_ids" in model_inputs:
                             student_top_k_ids = model_inputs["student_top_k_ids"]
 
-                        entropy, log_prob, _, topk_log_probs = self._forward_micro_batch(
-                            model_inputs, temperature=temperature, calculate_entropy=calculate_entropy,
-                            top_k=top_k, student_top_k_ids=student_top_k_ids
-                        )
+                        with _actor_update_nvtx("forward"):
+                            entropy, log_prob, _, topk_log_probs = self._forward_micro_batch(
+                                model_inputs, temperature=temperature, calculate_entropy=calculate_entropy,
+                                top_k=top_k, student_top_k_ids=student_top_k_ids
+                            )
                         log_prob_for_loss = topk_log_probs
 
                         # MT-OPD M4: refresh the reward against the *current* student.
@@ -1162,112 +1175,117 @@ class DataParallelPPOActor(BasePPOActor):
                             micro_batch_metrics["mt_opd/m4_advantage_refreshed"] = 1.0
 
                     else:
-                        _, log_prob, *_ = self._forward_micro_batch(
-                            model_inputs, temperature=temperature, calculate_entropy=calculate_entropy
-                        )
+                        with _actor_update_nvtx("forward"):
+                            _, log_prob, *_ = self._forward_micro_batch(
+                                model_inputs, temperature=temperature, calculate_entropy=calculate_entropy
+                            )
                         log_prob_for_loss = log_prob
 
-                    # MT-OPD M1: rebalance each domain's share of the gradient. Applied
-                    # here, after M4, so a refreshed advantage still carries the domain
-                    # weighting.
-                    #
-                    # Applied to the advantage rather than to response_mask. Scaling the
-                    # mask would work -- token-mean is sum(loss*mask)/sum(mask), and the
-                    # weights are normalised to token-weighted mean 1 so the denominator
-                    # is unchanged, making the two numerically equivalent here -- but
-                    # response_mask is also the averaging mask for ppo_kl and
-                    # pg_clipfrac. Scaling it would turn those into domain-weighted
-                    # means, and with IF's weight around 37x they would report almost
-                    # only IF. The advantage carries the loss and nothing else.
-                    if "domain_loss_weight" in model_inputs:
-                        _dw = model_inputs["domain_loss_weight"].to(advantages.dtype)
-                        advantages = advantages * _dw.view(
-                            -1, *([1] * (advantages.dim() - 1))
-                        )
+                    with _actor_update_nvtx("loss"):
+                        # MT-OPD M1: rebalance each domain's share of the gradient. Applied
+                        # here, after M4, so a refreshed advantage still carries the domain
+                        # weighting.
+                        #
+                        # Applied to the advantage rather than to response_mask. Scaling the
+                        # mask would work -- token-mean is sum(loss*mask)/sum(mask), and the
+                        # weights are normalised to token-weighted mean 1 so the denominator
+                        # is unchanged, making the two numerically equivalent here -- but
+                        # response_mask is also the averaging mask for ppo_kl and
+                        # pg_clipfrac. Scaling it would turn those into domain-weighted
+                        # means, and with IF's weight around 37x they would report almost
+                        # only IF. The advantage carries the loss and nothing else.
+                        if "domain_loss_weight" in model_inputs:
+                            _dw = model_inputs["domain_loss_weight"].to(advantages.dtype)
+                            advantages = advantages * _dw.view(
+                                -1, *([1] * (advantages.dim() - 1))
+                            )
 
-                    format_mask = None
-                    if "format_mask" in model_inputs.keys():
-                        format_mask = model_inputs["format_mask"]
-            
+                        format_mask = None
+                        if "format_mask" in model_inputs.keys():
+                            format_mask = model_inputs["format_mask"]
 
-                    # for fully_async_policy recipe
-                    if hasattr(self.config, "use_rollout_log_probs") and self.config.use_rollout_log_probs:
-                        old_log_prob = model_inputs["old_log_probs"]
-                    else:
-                        if on_policy:
-                            print("on_policy")
-                            # For on-policy (ppo_epochs=1), use current policy as "old"
-                            # log_prob_for_loss is already 3D for top-k case
-                            old_log_prob = log_prob_for_loss.detach()
+
+                        # for fully_async_policy recipe
+                        if hasattr(self.config, "use_rollout_log_probs") and self.config.use_rollout_log_probs:
+                            old_log_prob = model_inputs["old_log_probs"]
                         else:
-                            print("off_policy")
-                            # For off-policy, use stored log probs
-                            # For 3D top-k case, use stored log probs (union or student)
-                            if advantages.dim() == 3:
-                                if "union_top_k_log_probs" in model_inputs:
-                                    old_log_prob = model_inputs["union_top_k_log_probs"]
-                                elif "student_top_k_log_probs" in model_inputs:
-                                    old_log_prob = model_inputs["student_top_k_log_probs"]
+                            if on_policy:
+                                print("on_policy")
+                                # For on-policy (ppo_epochs=1), use current policy as "old"
+                                # log_prob_for_loss is already 3D for top-k case
+                                old_log_prob = log_prob_for_loss.detach()
+                            else:
+                                print("off_policy")
+                                # For off-policy, use stored log probs
+                                # For 3D top-k case, use stored log probs (union or student)
+                                if advantages.dim() == 3:
+                                    if "union_top_k_log_probs" in model_inputs:
+                                        old_log_prob = model_inputs["union_top_k_log_probs"]
+                                    elif "student_top_k_log_probs" in model_inputs:
+                                        old_log_prob = model_inputs["student_top_k_log_probs"]
+                                    else:
+                                        old_log_prob = model_inputs["old_log_probs"]
                                 else:
                                     old_log_prob = model_inputs["old_log_probs"]
-                            else:
-                                old_log_prob = model_inputs["old_log_probs"]
 
-                    loss_mode = self.config.policy_loss.get("loss_mode", "vanilla")
-                    # vanilla -> verl.trainer.ppo.core_algos.compute_policy_loss_vanilla
+                        loss_mode = self.config.policy_loss.get("loss_mode", "vanilla")
+                        # vanilla -> verl.trainer.ppo.core_algos.compute_policy_loss_vanilla
 
-                    # Extract pre-computed rollout correction weights if present
-                    # Weights are computed centrally in trainer and added when algorithm.rollout_is=True
-                    rollout_is_weights = model_inputs.get("rollout_is_weights", None)
+                        # Extract pre-computed rollout correction weights if present
+                        # Weights are computed centrally in trainer and added when algorithm.rollout_is=True
+                        rollout_is_weights = model_inputs.get("rollout_is_weights", None)
 
-                    # NOTE: Both mismatch diagnostic metrics (PPL, KL, etc.) and IS weight metrics
-                    # are computed centrally in ray_trainer.py for consistency and efficiency.
-                    # This ensures metrics are computed uniformly across all batches at the trainer level
-                    # and avoids redundant computation across workers and micro-batches.
+                        # NOTE: Both mismatch diagnostic metrics (PPL, KL, etc.) and IS weight metrics
+                        # are computed centrally in ray_trainer.py for consistency and efficiency.
+                        # This ensures metrics are computed uniformly across all batches at the trainer level
+                        # and avoids redundant computation across workers and micro-batches.
 
-                    # gpg -> verl.trainer.ppo.core_algos.compute_policy_loss_gpg
-                    # clip_cov -> verl.trainer.ppo.core_algos.compute_policy_loss_clip_cov
-                    policy_loss_fn = get_policy_loss_fn(loss_mode)
+                        # gpg -> verl.trainer.ppo.core_algos.compute_policy_loss_gpg
+                        # clip_cov -> verl.trainer.ppo.core_algos.compute_policy_loss_clip_cov
+                        policy_loss_fn = get_policy_loss_fn(loss_mode)
 
-                    # Compute policy loss (any function is expected to return 2 values)
-                    pg_loss, pg_metrics = policy_loss_fn(
-                        old_log_prob=old_log_prob,
-                        log_prob=log_prob_for_loss,  # 3D for top-k, 2D otherwise
-                        advantages=advantages,
-                        response_mask=response_mask,
-                        loss_agg_mode=loss_agg_mode,
-                        config=self.config,
-                        rollout_is_weights=rollout_is_weights,
-                        format_mask=format_mask,
-                    )
-                    micro_batch_metrics.update(pg_metrics)
-
-                    if entropy_coeff != 0:
-                        entropy_loss = agg_loss(loss_mat=entropy, loss_mask=response_mask, loss_agg_mode=loss_agg_mode)
-
-                        # compute policy loss
-                        policy_loss = pg_loss - entropy_loss * entropy_coeff
-                    else:
-                        policy_loss = pg_loss
-
-                    if self.config.use_kl_loss:
-                        ref_log_prob = model_inputs["ref_log_prob"]
-                        # compute kl loss
-                        kld = kl_penalty(
-                            logprob=log_prob, ref_logprob=ref_log_prob, kl_penalty=self.config.kl_loss_type
+                        # Compute policy loss (any function is expected to return 2 values)
+                        pg_loss, pg_metrics = policy_loss_fn(
+                            old_log_prob=old_log_prob,
+                            log_prob=log_prob_for_loss,  # 3D for top-k, 2D otherwise
+                            advantages=advantages,
+                            response_mask=response_mask,
+                            loss_agg_mode=loss_agg_mode,
+                            config=self.config,
+                            rollout_is_weights=rollout_is_weights,
+                            format_mask=format_mask,
                         )
-                        kl_loss = agg_loss(loss_mat=kld, loss_mask=response_mask, loss_agg_mode=loss_agg_mode)
+                        micro_batch_metrics.update(pg_metrics)
 
-                        policy_loss = policy_loss + kl_loss * effective_kl_loss_coef
-                        micro_batch_metrics["actor/kl_loss"] = kl_loss.detach().item() * loss_scale_factor
-                        micro_batch_metrics["actor/kl_coef"] = effective_kl_loss_coef
+                        if entropy_coeff != 0:
+                            entropy_loss = agg_loss(
+                                loss_mat=entropy, loss_mask=response_mask, loss_agg_mode=loss_agg_mode
+                            )
 
-                    if self.config.use_dynamic_bsz:
-                        # relative to the dynamic bsz
-                        loss = policy_loss * loss_scale_factor
-                    else:
-                        loss = policy_loss * loss_scale_factor
-                    loss.backward()
+                            # compute policy loss
+                            policy_loss = pg_loss - entropy_loss * entropy_coeff
+                        else:
+                            policy_loss = pg_loss
+
+                        if self.config.use_kl_loss:
+                            ref_log_prob = model_inputs["ref_log_prob"]
+                            # compute kl loss
+                            kld = kl_penalty(
+                                logprob=log_prob, ref_logprob=ref_log_prob, kl_penalty=self.config.kl_loss_type
+                            )
+                            kl_loss = agg_loss(loss_mat=kld, loss_mask=response_mask, loss_agg_mode=loss_agg_mode)
+
+                            policy_loss = policy_loss + kl_loss * effective_kl_loss_coef
+                            micro_batch_metrics["actor/kl_loss"] = kl_loss.detach().item() * loss_scale_factor
+                            micro_batch_metrics["actor/kl_coef"] = effective_kl_loss_coef
+
+                        if self.config.use_dynamic_bsz:
+                            # relative to the dynamic bsz
+                            loss = policy_loss * loss_scale_factor
+                        else:
+                            loss = policy_loss * loss_scale_factor
+                    with _actor_update_nvtx("backward"):
+                        loss.backward()
 
                     micro_batch_metrics["actor/pg_loss"] = pg_loss.detach().item() * loss_scale_factor
                     append_to_dict(metrics, micro_batch_metrics)

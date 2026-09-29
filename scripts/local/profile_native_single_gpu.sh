@@ -4,6 +4,7 @@ set -euo pipefail
 
 SHARE_STUDENT_WEIGHTS="${SHARE_STUDENT_WEIGHTS:-true}"
 BF16_STUDENT_WEIGHTS="${BF16_STUDENT_WEIGHTS:-true}"
+OPTIMIZER_OFFLOAD_PER_LAYER="${OPTIMIZER_OFFLOAD_PER_LAYER:-true}"
 # Overlap the primary teacher (Math) with student log-prob scoring.
 TEACHER_PARAM_PREFETCH="${TEACHER_PARAM_PREFETCH:-true}"
 TEACHER_PARAM_PREFETCH_MAX_MB="${TEACHER_PARAM_PREFETCH_MAX_MB:-768}"
@@ -142,6 +143,7 @@ actor_rollout_ref.rollout.max_model_len=1536 \
 actor_rollout_ref.actor.ppo_mini_batch_size="${train_batch_size}" \
 actor_rollout_ref.actor.ppo_micro_batch_size_per_gpu=1 \
 actor_rollout_ref.actor.fsdp_config.optimizer_offload=True \
+actor_rollout_ref.actor.fsdp_config.optimizer_offload_per_layer="${OPTIMIZER_OFFLOAD_PER_LAYER}" \
 actor_rollout_ref.actor.optim.override_optimizer_config='{foreach:false}' \
 actor_rollout_ref.rollout.tensor_model_parallel_size=1 \
 actor_rollout_ref.rollout.log_prob_micro_batch_size_per_gpu=1 \

@@ -90,6 +90,7 @@ class FSDPEngineConfig(BaseConfig):
         wrap_policy (Dict[str, Any]): Configuration for FSDP wrap policy.
         param_offload (bool): Whether to offload parameters to CPU, default False
         optimizer_offload (bool): Whether to offload optimizer states to CPU, default False
+        optimizer_offload_per_layer (bool): Stage actor optimizer states one layer at a time after backward (FSDP1).
         offload_policy (bool): Whether to offload policy model parameters, default False
         reshard_after_forward (bool): Whether to reshard parameters after forward pass, default True
         fsdp_size (int): FSDP group size. -1 means use all available GPUs.
@@ -102,6 +103,7 @@ class FSDPEngineConfig(BaseConfig):
     wrap_policy: dict[str, Any] = field(default_factory=dict)
     param_offload: bool = False
     optimizer_offload: bool = False
+    optimizer_offload_per_layer: bool = False
     offload_policy: bool = False
     reshard_after_forward: bool = True
     fsdp_size: int = -1

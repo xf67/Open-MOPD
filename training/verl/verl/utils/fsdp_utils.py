@@ -33,6 +33,7 @@ from torch.distributed.fsdp.wrap import size_based_auto_wrap_policy, transformer
 from transformers.trainer_pt_utils import get_module_class_from_name
 
 from verl.utils.device import get_device_id, get_device_name, get_torch_device
+from verl.utils.layerwise_optimizer import LayerwiseOffloadOptimizer
 from verl.utils.model import check_exclude_modules, check_target_modules
 
 if version.parse(torch.__version__) >= version.parse("2.6"):
@@ -245,6 +246,9 @@ def load_fsdp2_model_to_gpu(model):
 
 @torch.no_grad()
 def offload_fsdp_optimizer(optimizer):
+    if isinstance(optimizer, LayerwiseOffloadOptimizer):
+        optimizer.offload_state()
+        return
     if not optimizer.state:
         return
     for param_group in optimizer.param_groups:
@@ -257,6 +261,9 @@ def offload_fsdp_optimizer(optimizer):
 
 @torch.no_grad()
 def load_fsdp_optimizer(optimizer, device_id):
+    if isinstance(optimizer, LayerwiseOffloadOptimizer):
+        # Its step() stages one layer after backward and global clipping.
+        return
     if not optimizer.state:
         return
     for param_group in optimizer.param_groups:
