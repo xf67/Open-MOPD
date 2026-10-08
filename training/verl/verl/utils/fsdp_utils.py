@@ -246,6 +246,9 @@ def load_fsdp2_model_to_gpu(model):
 
 @torch.no_grad()
 def offload_fsdp_optimizer(optimizer):
+    from verl.utils.cpu_adam_pipeline import CPUAdamPipeline
+    if isinstance(optimizer, CPUAdamPipeline):
+        return  # CPU states are persistent; do not wait for the pending update.
     if isinstance(optimizer, LayerwiseOffloadOptimizer):
         optimizer.offload_state()
         return
@@ -261,6 +264,9 @@ def offload_fsdp_optimizer(optimizer):
 
 @torch.no_grad()
 def load_fsdp_optimizer(optimizer, device_id):
+    from verl.utils.cpu_adam_pipeline import CPUAdamPipeline
+    if isinstance(optimizer, CPUAdamPipeline):
+        return
     if isinstance(optimizer, LayerwiseOffloadOptimizer):
         # Its step() stages one layer after backward and global clipping.
         return

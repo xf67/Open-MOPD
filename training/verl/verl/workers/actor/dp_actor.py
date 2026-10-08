@@ -890,9 +890,12 @@ class DataParallelPPOActor(BasePPOActor):
 
     def _optimizer_step(self):
         assert self.config.grad_clip is not None
+        from verl.utils.cpu_adam_pipeline import CPUAdamPipeline
 
         with _actor_update_nvtx("grad_clip"):
-            if isinstance(self.actor_module, FSDP):
+            if isinstance(self.actor_optimizer, CPUAdamPipeline):
+                grad_norm = self.actor_optimizer.clip_grad_norm_(self.config.grad_clip)
+            elif isinstance(self.actor_module, FSDP):
                 grad_norm = self.actor_module.clip_grad_norm_(max_norm=self.config.grad_clip)
             elif isinstance(self.actor_module, FSDPModule):
                 grad_norm = fsdp2_clip_grad_norm_(self.actor_module.parameters(), max_norm=self.config.grad_clip)
@@ -909,6 +912,11 @@ class DataParallelPPOActor(BasePPOActor):
             print(f"WARN: rank {torch.distributed.get_rank()} grad_norm is not finite: {grad_norm}")
             self.actor_optimizer.zero_grad()
         else:
+            if isinstance(self.actor_optimizer, CPUAdamPipeline):
+                # Read this scalar BEFORE submitting the large gradient D2H.
+                # A later .item() otherwise queues behind that DMA and stalls
+                # the host thread that needs to launch the next rollout.
+                grad_norm = grad_norm.cpu()
             with _actor_update_nvtx("optimizer_step"):
                 self.actor_optimizer.step()
         return grad_norm
@@ -941,6 +949,7 @@ class DataParallelPPOActor(BasePPOActor):
 
         micro_batch_size = data.meta_info["micro_batch_size"]
         temperature = data.meta_info["temperature"]  # temperature must be in the data.meta_info to avoid silent error
+
         use_dynamic_bsz = data.meta_info["use_dynamic_bsz"]
         has_multi_modal_inputs = "multi_modal_inputs" in data.non_tensor_batch.keys()
         select_keys = ["responses", "input_ids", "attention_mask", "position_ids"]
@@ -1012,6 +1021,11 @@ class DataParallelPPOActor(BasePPOActor):
         # make sure we are in training mode
         self.actor_module.train()
 
+        if data.meta_info.get("opd_pipeline", False) and (
+            not self._opd_refresh_advantage or "teacher_on_student_log_probs" not in data.batch
+        ):
+            raise ValueError("pipeline OPD requires cached teacher log-probs to refresh the current signal")
+
         effective_kl_loss_coef = float(data.meta_info.get("actor_kl_loss_coef", self.config.kl_loss_coef))
 
         temperature = data.meta_info["temperature"]  # temperature must be in the data.meta_info to avoid silent error
@@ -1079,7 +1093,14 @@ class DataParallelPPOActor(BasePPOActor):
         # See PPO paper for details. https://arxiv.org/abs/1707.06347
         mini_batches = data.split(self.config.ppo_mini_batch_size)
 
-        on_policy = len(mini_batches) == 1 and self.config.ppo_epochs == 1
+        pipeline = data.meta_info.get("opd_pipeline", False)
+        if pipeline and (len(mini_batches) != 1 or self.config.ppo_epochs != 1):
+            raise ValueError("CPU OPD pipeline requires exactly one optimizer step per batch")
+        if pipeline and self.actor_optimizer.gradient_offload and (
+            self.config.use_dynamic_bsz or self.config.ppo_micro_batch_size_per_gpu < len(data)
+        ):
+            raise ValueError("early gradient offload requires one fixed training micro-batch per step")
+        on_policy = len(mini_batches) == 1 and self.config.ppo_epochs == 1 and not pipeline
 
         metrics = {}
         for _ in range(self.config.ppo_epochs):
@@ -1209,9 +1230,12 @@ class DataParallelPPOActor(BasePPOActor):
                         if hasattr(self.config, "use_rollout_log_probs") and self.config.use_rollout_log_probs:
                             old_log_prob = model_inputs["old_log_probs"]
                         else:
-                            if on_policy:
-                                print("on_policy")
-                                # For on-policy (ppo_epochs=1), use current policy as "old"
+                            if on_policy or pipeline:
+                                print("pipeline_current_signal" if pipeline else "on_policy")
+                                # Pipeline OPD refreshes the current-student signal
+                                # on a fixed old support; it does not apply a PPO
+                                # ratio to log-probs from the earlier scoring model.
+                                # Fresh on-policy batches use the same ratio=1 form.
                                 # log_prob_for_loss is already 3D for top-k case
                                 old_log_prob = log_prob_for_loss.detach()
                             else:

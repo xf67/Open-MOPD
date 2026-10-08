@@ -39,3 +39,8 @@ ms_sync/
 outputs/
 output/
 logs/
+NATIVE_SINGLE_GPU_NSYS_PROFILE.md
+SHARED_STUDENT_WEIGHTS.md
+r.md
+scripts/local/LAYERWISE_OPTIMIZER.md
+scripts/local/STUDENT_TEACHER_PIPELINE.md

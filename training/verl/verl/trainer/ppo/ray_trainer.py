@@ -643,8 +643,19 @@ class RayPPOTrainer:
         self.use_delta_opd = self.reward_mode == "delta_opd"
         self.use_mt_opd = self.reward_mode == "mt_opd"
         self.teacher_forward_overlap = self.config.actor_rollout_ref.rollout.get("teacher_forward_overlap", False)
+        self.student_teacher_pipeline = self.config.actor_rollout_ref.rollout.get("student_teacher_pipeline", False)
+        if self.student_teacher_pipeline and (
+            not self.use_mt_opd or not self.use_rm or not self.teacher_forward_overlap
+            or self.config.actor_rollout_ref.rollout.get("top_k_strategy", "only_stu") != "only_stu"
+            or self.config.algorithm.adv_estimator != "token_reward_direct"
+        ):
+            raise ValueError("student teacher pipeline requires MT-OPD, only_stu, token_reward_direct and joint scoring")
         if self.teacher_forward_overlap and (not self.use_mt_opd or not self.use_rm):
             raise ValueError("teacher_forward_overlap currently requires MT-OPD with a reward model")
+        if self.config.actor_rollout_ref.rollout.get("teacher_layer_pipeline", False) and (
+            not self.use_mt_opd or not self.use_rm
+        ):
+            raise ValueError("teacher_layer_pipeline requires MT-OPD with colocated reward models")
         # ExOPD combines the standard OPD reward with the Direct-OPD
         # teacher/reference gap, so it needs the same reference scorer as
         # delta_opd. lambda == 1 reduces it to plain opd_kl.
@@ -2112,10 +2123,14 @@ class RayPPOTrainer:
                             elif reward_mode == "mt_opd":
                                 # --- MT-OPD: route per-domain RL teacher, then standard OPD distillation ---
                                 for i, extra_wg in enumerate(self.mt_rm_wgs, start=1):
+                                    teacher_key = f"mt_teacher_{i}_on_student_log_probs"
+                                    if self.teacher_forward_overlap and teacher_key in scoring_output.batch:
+                                        # The joint scorer already ran this colocated teacher.
+                                        continue
                                     with marked_timer(f"compute_mt_rm_{i}_score", timing_raw, color="magenta"):
                                         extra_raw = extra_wg.compute_rm_score(batch)
                                     batch = batch.union(DataProto.from_dict(tensors={
-                                        f"mt_teacher_{i}_on_student_log_probs": extra_raw.batch["teacher_on_student_log_probs"],
+                                        teacher_key: extra_raw.batch["teacher_on_student_log_probs"],
                                     }))
 
                                 domains = batch.non_tensor_batch.get("domain", None)
@@ -3498,6 +3513,11 @@ class RayPPOTrainer:
                         "student_log_probs_on_teacher_ids",
                     ]
                     for key in keys_to_pop:
+                        if key == "teacher_on_student_log_probs" and (
+                            self.student_teacher_pipeline
+                            or self.config.actor_rollout_ref.actor.get("opd_refresh_advantage", False)
+                        ):
+                            continue  # The learner refreshes OPD against its current weights.
                         if key in batch.batch.keys():
                             batch.batch.pop(key)
 
@@ -3539,6 +3559,10 @@ class RayPPOTrainer:
                             actor_output = self.actor_rollout_wg.update_actor(batch)
                         actor_output_metrics = reduce_metrics(actor_output.meta_info["metrics"])
                         metrics.update(actor_output_metrics)
+
+                if is_last_step and self.student_teacher_pipeline:
+                    with marked_timer("flush_pipeline", timing_raw):
+                        self.actor_rollout_wg.flush_pipeline()
 
                 # Check if the ESI (Elastic Server Instance)/training plan is close to expiration.
                 esi_close_to_expiration = should_save_ckpt_esi(

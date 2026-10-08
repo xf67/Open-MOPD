@@ -16,6 +16,11 @@ Common environment:
   SHARE_STUDENT_WEIGHTS             Share BF16 actor/vLLM weights (default: true)
   BF16_STUDENT_WEIGHTS              Use BF16 when sharing is disabled (default: true)
   OPTIMIZER_OFFLOAD_PER_LAYER       Stage optimizer states per layer (default: true)
+  STUDENT_TEACHER_PIPELINE          CPU Adam + shared student/teacher slots (default: false)
+  PIPELINE_OVERLAP                  Overlap CPU/copies; false is serial reference (default: true)
+  CPU_OPTIMIZER_THREADS             CPU Adam worker threads (default: 8)
+  PIPELINE_GRADIENT_OFFLOAD        Offload completed gradients during backward (default: true)
+  TEACHER_LAYER_PIPELINE            Share slots among teachers only (default: false)
   TEACHER_PARAM_PREFETCH            Prefetch primary teacher parameters (default: true)
   TEACHER_PARAM_PREFETCH_MAX_MB      Teacher prefetch cap in MiB (default: 768)
   TEACHER_FORWARD_OVERLAP           Overlap student/teacher scoring (default: true)
@@ -33,6 +38,10 @@ Common environment:
 Nsight-only options:
   OPENMOPD_NSYS                     nsys executable (default: /usr/local/cuda-12/bin/nsys)
   OPENMOPD_TRACE_WAIT_SECONDS       Wait for a finalized capture (default: 300)
+  OPENMOPD_NSYS_CPU_SAMPLING        process-tree or none; none also disables CPU scheduling trace
+                                  (default: process-tree; CUDA/NVTX remain enabled)
+  OPENMOPD_NSYS_SAMPLING_PERIOD     CPU reference cycles per sample, 237500..30400000 (default: 19000000)
+  OPENMOPD_NSYS_SAMPLES_PER_BACKTRACE  CPU samples per call stack, 1..32 (default: 4)
 
 CUDA-memory-only options:
   OPENMOPD_MEMORY_MAX_ENTRIES        Allocation history capacity (default: 1000000)
@@ -86,7 +95,14 @@ profile_init() {
   nsys_bin="${OPENMOPD_NSYS:-/usr/local/cuda-12/bin/nsys}"
   SHARE_STUDENT_WEIGHTS="${SHARE_STUDENT_WEIGHTS:-true}"
   BF16_STUDENT_WEIGHTS="${BF16_STUDENT_WEIGHTS:-true}"
-  OPTIMIZER_OFFLOAD_PER_LAYER="${OPTIMIZER_OFFLOAD_PER_LAYER:-true}"
+  STUDENT_TEACHER_PIPELINE="${STUDENT_TEACHER_PIPELINE:-true}"
+  PIPELINE_OVERLAP="${PIPELINE_OVERLAP:-true}"
+  CPU_OPTIMIZER_THREADS="${CPU_OPTIMIZER_THREADS:-8}"
+  PIPELINE_GRADIENT_OFFLOAD="${PIPELINE_GRADIENT_OFFLOAD:-true}"
+  TEACHER_LAYER_PIPELINE="${TEACHER_LAYER_PIPELINE:-false}"
+  local optimizer_layer_default=true
+  if [[ "${STUDENT_TEACHER_PIPELINE}" == true ]]; then optimizer_layer_default=false; fi
+  OPTIMIZER_OFFLOAD_PER_LAYER="${OPTIMIZER_OFFLOAD_PER_LAYER:-${optimizer_layer_default}}"
   TEACHER_PARAM_PREFETCH="${TEACHER_PARAM_PREFETCH:-true}"
   TEACHER_PARAM_PREFETCH_MAX_MB="${TEACHER_PARAM_PREFETCH_MAX_MB:-768}"
   TEACHER_FORWARD_OVERLAP="${TEACHER_FORWARD_OVERLAP:-true}"
@@ -99,14 +115,18 @@ profile_init() {
   sample_ms="${OPENMOPD_MEMORY_SAMPLE_MS:-100}"
   max_entries="${OPENMOPD_MEMORY_MAX_ENTRIES:-1000000}"
   trace_wait_seconds="${OPENMOPD_TRACE_WAIT_SECONDS:-300}"
+  nsys_cpu_sampling="${OPENMOPD_NSYS_CPU_SAMPLING:-process-tree}"
+  nsys_sampling_period="${OPENMOPD_NSYS_SAMPLING_PERIOD:-19000000}"
+  nsys_samples_per_backtrace="${OPENMOPD_NSYS_SAMPLES_PER_BACKTRACE:-4}"
 
   local var prefix override key
   for var in SHARE_STUDENT_WEIGHTS BF16_STUDENT_WEIGHTS OPTIMIZER_OFFLOAD_PER_LAYER \
-    TEACHER_PARAM_PREFETCH TEACHER_FORWARD_OVERLAP val_before_train; do
+    TEACHER_PARAM_PREFETCH TEACHER_FORWARD_OVERLAP STUDENT_TEACHER_PIPELINE PIPELINE_OVERLAP \
+    TEACHER_LAYER_PIPELINE PIPELINE_GRADIENT_OFFLOAD val_before_train; do
     [[ "${!var}" == true || "${!var}" == false ]] || profile_die "${var} must be true or false"
   done
   for var in num_gpus train_batch_size profile_step profile_step_count \
-    TEACHER_PARAM_PREFETCH_MAX_MB CUDA_DEVICE_MAX_CONNECTIONS; do
+    TEACHER_PARAM_PREFETCH_MAX_MB CUDA_DEVICE_MAX_CONNECTIONS CPU_OPTIMIZER_THREADS; do
     [[ "${!var}" =~ ^[1-9][0-9]*$ ]] || profile_die "${var} must be a positive integer"
   done
   [[ "${sample_ms}" =~ ^(0|[1-9][0-9]*)$ ]] || profile_die "OPENMOPD_MEMORY_SAMPLE_MS must be non-negative"
@@ -121,6 +141,14 @@ profile_init() {
     nsys)
       prefix=native_nsys
       [[ "${trace_wait_seconds}" =~ ^(0|[1-9][0-9]*)$ ]] || profile_die "OPENMOPD_TRACE_WAIT_SECONDS must be non-negative"
+      [[ "${nsys_cpu_sampling}" == process-tree || "${nsys_cpu_sampling}" == none ]] || \
+        profile_die "OPENMOPD_NSYS_CPU_SAMPLING must be process-tree or none"
+      [[ "${nsys_sampling_period}" =~ ^[1-9][0-9]{0,7}$ ]] && \
+        ((nsys_sampling_period >= 237500 && nsys_sampling_period <= 30400000)) || \
+        profile_die "OPENMOPD_NSYS_SAMPLING_PERIOD must be an integer in 237500..30400000 reference cycles"
+      [[ "${nsys_samples_per_backtrace}" =~ ^[1-9][0-9]?$ ]] && \
+        ((nsys_samples_per_backtrace <= 32)) || \
+        profile_die "OPENMOPD_NSYS_SAMPLES_PER_BACKTRACE must be an integer in 1..32"
       ;;
     torch_memory)
       prefix=native_memory
@@ -176,7 +204,7 @@ profile_build_command() {
     algorithm.adv_estimator=token_reward_direct
     "data.train_files=$(profile_hydra_string "${model_root}/data/rl_prompt_mix/train.parquet")"
     "data.val_files=$(profile_hydra_string "${model_root}/data/rl_prompt_mix/eval.parquet")"
-    data.train_batch_size="${train_batch_size}" data.max_prompt_length=512 data.max_response_length=1024
+    data.train_batch_size="${train_batch_size}" data.max_prompt_length=1024 data.max_response_length=4096
     data.filter_overlong_prompts=True data.truncation=error
     "actor_rollout_ref.model.path=$(profile_hydra_string "${model_root}/MixSFT")"
     actor_rollout_ref.rollout.name=vllm
@@ -184,8 +212,13 @@ profile_build_command() {
     actor_rollout_ref.rollout.teacher_param_prefetch="${TEACHER_PARAM_PREFETCH}"
     actor_rollout_ref.rollout.teacher_param_prefetch_max_mb="${TEACHER_PARAM_PREFETCH_MAX_MB}"
     actor_rollout_ref.rollout.teacher_forward_overlap="${TEACHER_FORWARD_OVERLAP}"
+    actor_rollout_ref.rollout.student_teacher_pipeline="${STUDENT_TEACHER_PIPELINE}"
+    actor_rollout_ref.rollout.pipeline_overlap="${PIPELINE_OVERLAP}"
+    actor_rollout_ref.rollout.cpu_optimizer_threads="${CPU_OPTIMIZER_THREADS}"
+    actor_rollout_ref.rollout.pipeline_gradient_offload="${PIPELINE_GRADIENT_OFFLOAD}"
+    actor_rollout_ref.rollout.teacher_layer_pipeline="${TEACHER_LAYER_PIPELINE}"
     +actor_rollout_ref.rollout.reward_mode=mt_opd
-    actor_rollout_ref.rollout.n=1 actor_rollout_ref.rollout.max_model_len=1536
+    actor_rollout_ref.rollout.n=1 actor_rollout_ref.rollout.max_model_len=5120
     actor_rollout_ref.actor.ppo_mini_batch_size="${train_batch_size}"
     actor_rollout_ref.actor.ppo_micro_batch_size_per_gpu=1
     actor_rollout_ref.actor.fsdp_config.optimizer_offload=True
@@ -231,6 +264,16 @@ profile_build_command() {
       global_profiler.global_tool_config.nsys.worker_nsight_options.kill=none
       "+global_profiler.global_tool_config.nsys.worker_nsight_options.o=${raw_dir}/worker_%p"
       "+global_profiler.global_tool_config.nsys.controller_nsight_options.o=${raw_dir}/controller_%p")
+    # Linux x86 Nsight uses reference cycles, not Hz. Reduce both IP sample
+    # frequency and backtrace volume to avoid overflowing the Perf buffers.
+    # Ray launches separate profilers for the controller and the GPU worker.
+    local role
+    for role in controller worker; do
+      cmd+=("++global_profiler.global_tool_config.nsys.${role}_nsight_options.sample=${nsys_cpu_sampling}"
+        "++global_profiler.global_tool_config.nsys.${role}_nsight_options.cpuctxsw=${nsys_cpu_sampling}"
+        "++global_profiler.global_tool_config.nsys.${role}_nsight_options.sampling-period=${nsys_sampling_period}"
+        "++global_profiler.global_tool_config.nsys.${role}_nsight_options.samples-per-backtrace=${nsys_samples_per_backtrace}")
+    done
   else
     cmd+=(global_profiler.profile_continuous_steps=false
       "global_profiler.save_path=$(profile_hydra_string "${run_dir}/snapshots")"
@@ -242,6 +285,10 @@ profile_build_command() {
   printf 'Teacher prefetch=%s; cap=%s MiB; forward overlap=%s; optimizer per layer=%s; CUDA connections=%s\n' \
     "${TEACHER_PARAM_PREFETCH}" "${TEACHER_PARAM_PREFETCH_MAX_MB}" "${TEACHER_FORWARD_OVERLAP}" \
     "${OPTIMIZER_OFFLOAD_PER_LAYER}" "${CUDA_DEVICE_MAX_CONNECTIONS}"
+  if [[ "${profile_tool}" == nsys ]]; then
+    printf 'Nsight CPU sampling/scheduling=%s; period=%s reference cycles; samples per backtrace=%s (before Hydra overrides)\n' \
+      "${nsys_cpu_sampling}" "${nsys_sampling_period}" "${nsys_samples_per_backtrace}"
+  fi
   if [[ "${dry_run}" == true ]]; then printf '%q ' "${cmd[@]}"; printf '\n'; exit 0; fi
 }
 

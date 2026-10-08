@@ -94,6 +94,7 @@ from verl.workers.config.optimizer import build_optimizer
 from verl.workers.rollout import get_rollout_class
 from verl.workers.sharding_manager.fsdp_ulysses import FSDPUlyssesShardingManager
 from verl.workers.teacher_forward_overlap import TeacherForwardOverlap
+from verl.workers.teacher_layer_pipeline import TeacherLayerPipeline
 from verl.workers.teacher_param_prefetch import TeacherHandlePrefetch
 
 _TEACHER_PREFETCH_POINT = "first_linear_pre"
@@ -646,7 +647,20 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
             from verl.utils.torch_functional import get_constant_schedule_with_warmup, get_cosine_schedule_with_warmup
 
             actor_optimizer = build_optimizer(actor_module_fsdp.parameters(), optim_config)
-            if fsdp_config.get("optimizer_offload_per_layer", False):
+            if self.config.rollout.get("student_teacher_pipeline", False):
+                from verl.utils.cpu_adam_pipeline import CPUAdamPipeline
+
+                if not self._share_rollout_weights or self.config.actor.ppo_epochs != 1:
+                    raise ValueError("student teacher pipeline requires shared weights and ppo_epochs=1")
+                if fsdp_config.get("optimizer_offload_per_layer", False):
+                    raise ValueError("CPU pipeline replaces optimizer_offload_per_layer; disable that option")
+                actor_optimizer = CPUAdamPipeline(
+                    actor_optimizer, actor_module_fsdp,
+                    overlap=self.config.rollout.pipeline_overlap,
+                    threads=self.config.rollout.cpu_optimizer_threads,
+                    gradient_offload=self.config.rollout.pipeline_gradient_offload,
+                )
+            elif fsdp_config.get("optimizer_offload_per_layer", False):
                 from verl.utils.layerwise_optimizer import LayerwiseOffloadOptimizer
 
                 actor_optimizer = LayerwiseOffloadOptimizer(actor_optimizer, actor_module_fsdp)
@@ -764,8 +778,11 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
 
     async def rollout_mode(self):
         """Context switch hybridengine to rollout mode."""
-        with _openmopd_nvtx("memory::empty_cache_before_rollout"):
-            aggressive_empty_cache(force_sync=True)
+        # The CPU pipeline has a pending D2H gradient copy. empty_cache and a
+        # device-wide sync here would serialize that copy with the next rollout.
+        if not self.config.rollout.get("student_teacher_pipeline", False):
+            with _openmopd_nvtx("memory::empty_cache_before_rollout"):
+                aggressive_empty_cache(force_sync=True)
 
         if self._share_rollout_weights:
             set_expandable_segments(False)
@@ -1016,7 +1033,12 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
                 checkpoint_config=checkpoint_contents,
             )
 
-        if self._is_actor and self.config.rollout.get("teacher_param_prefetch", False):
+        if self._is_actor and (
+            self.config.rollout.get("teacher_layer_pipeline", False)
+            or self.config.rollout.get("student_teacher_pipeline", False)
+        ):
+            self.prepare_teacher_layer_pipeline()
+        elif self._is_actor and self.config.rollout.get("teacher_param_prefetch", False):
             teacher = self.get_fused_worker_by_name("rm")
             if teacher is None:
                 raise ValueError("teacher parameter prefetch requires colocated actor and reward model workers")
@@ -1031,6 +1053,67 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
             if teacher is None:
                 raise ValueError("teacher forward overlap requires a colocated primary reward worker")
             teacher.prepare_forward_overlap()
+
+    def prepare_teacher_layer_pipeline(self):
+        """Connect colocated teachers in the same order used by MT-OPD scoring."""
+        if self.world_size != 1 or self.ulysses_sequence_parallel_size != 1:
+            raise ValueError("teacher layer pipeline requires one GPU and SP=1")
+        roles = ["rm"] + sorted(
+            (name for name in self.fused_worker_dict if name.startswith("mt_rm_")),
+            key=lambda name: int(name.removeprefix("mt_rm_")),
+        )
+        teachers = [self.get_fused_worker_by_name(name) for name in roles]
+        if len(teachers) < 2 or any(teacher is None for teacher in teachers):
+            raise ValueError("teacher layer pipeline requires at least two colocated MT-OPD teachers")
+        for teacher in teachers:
+            if (
+                teacher.world_size != 1
+                or teacher.ulysses_sequence_parallel_size != 1
+                or teacher.config.use_dynamic_bsz
+                or (teacher.config.micro_batch_size_per_gpu or 0) < 1
+                or teacher.use_fused_kernels
+                or teacher._do_switch_chat_template
+            ):
+                raise ValueError(
+                    "teacher layer pipeline requires one GPU, SP=1, a positive fixed micro-batch size, "
+                    "unfused teachers and no chat-template switching"
+                )
+            if getattr(teacher, "_teacher_layer_pipeline", None) is not None:
+                raise ValueError("teacher layer pipeline is already initialized")
+            teacher.reward_module.eval()
+        pipeline_type = TeacherLayerPipeline
+        pipeline_kwargs = {}
+        if self.config.rollout.get("student_teacher_pipeline", False):
+            from verl.workers.student_teacher_pipeline import StudentTeacherPipeline
+
+            if not self.config.rollout.teacher_forward_overlap:
+                raise ValueError("student teacher pipeline requires teacher_forward_overlap=true")
+            pipeline_type = StudentTeacherPipeline
+            pipeline_kwargs = dict(
+                student=self.actor_module_fsdp, optimizer=self.actor_optimizer,
+                overlap=self.config.rollout.pipeline_overlap,
+            )
+            with open_dict(self.config.actor):
+                self.config.actor.opd_refresh_advantage = True
+            self.actor._opd_refresh_advantage = True
+            self.actor._opd_reward_weight_mode = self.config.rollout.get("reward_weight_mode", "student_p")
+            self.rollout.pipeline_start_optimizer = self.actor_optimizer.start
+        pipeline = pipeline_type(
+            models=[teacher.reward_module for teacher in teachers],
+            names=[
+                f"{role}-{os.path.basename(str(teacher.config.model.path).rstrip('/'))}"
+                for role, teacher in zip(roles, teachers, strict=True)
+            ],
+            max_mb=self.config.rollout.teacher_layer_pipeline_max_mb,
+            **pipeline_kwargs,
+        )
+        self._scoring_layer_pipeline = pipeline
+        for teacher in teachers:
+            teacher._teacher_layer_pipeline = pipeline
+        print(
+            f"Teacher layer pipeline: {pipeline.names}, {len(pipeline.slots)} shared slots, "
+            f"{pipeline.bytes / 2**20:.1f} MiB total"
+        )
 
     @register(dispatch_mode=make_nd_compute_dataproto_dispatch_fn(mesh_name="actor"))
     @DistProfiler.annotate(color="red", role="actor_update")
@@ -1050,6 +1133,12 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
             # perform training
             with Timer(name="update_policy", logger=None) as timer:
                 metrics = self.actor.update_policy(data=data)
+            if self.config.rollout.get("student_teacher_pipeline", False):
+                metrics.update(self.actor_optimizer.last_metrics)
+                metrics["pipeline/policy_lag"] = (
+                    data.meta_info["learner_policy_version"] - data.meta_info["scoring_policy_version"]
+                )
+                metrics["pipeline/learner_version"] = self.actor_optimizer.version
             delta_time = timer.last
             global_num_tokens = data.meta_info["global_token_num"]
             estimated_flops, promised_flops = self.flops_counter.estimate_flops(global_num_tokens, delta_time)
@@ -1086,6 +1175,8 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
     def generate_sequences(self, prompts: DataProto):
         # Support all hardwares
         assert self._is_rollout
+        if prompts.meta_info.get("validate", False):
+            self.flush_pipeline()
         with _openmopd_nvtx("io::h2d::rollout_inputs"):
             prompts = prompts.to(get_device_id())
 
@@ -1165,7 +1256,10 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
         if teacher_forward_callback is not None:
             # The joint scorer owns both parameter staging and model submission.
             prefetch_callback = teacher_forward_callback
-        elif not is_lora and self.config.rollout.get("teacher_param_prefetch", False):
+        elif not is_lora and (
+            self.config.rollout.get("teacher_param_prefetch", False)
+            or self.config.rollout.get("teacher_layer_pipeline", False)
+        ):
             # Adapter-disabled reference scoring has no following teacher forward.
             teacher = self.get_fused_worker_by_name("rm")
             if teacher is None:
@@ -1209,16 +1303,21 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
 
     @register(dispatch_mode=make_nd_compute_dataproto_dispatch_fn(mesh_name="actor"))
     def compute_log_prob_and_teacher(self, data: DataProto):
-        """Overlap model forwards; run unchanged teacher scoring after IDs are ready."""
+        """Overlap student/primary forwards, then score colocated MT teachers before returning."""
         if not self.config.rollout.get("teacher_forward_overlap", False):
             raise ValueError("joint scoring requires teacher_forward_overlap=true")
-        if len(data) != 1 or self.config.rollout.log_prob_use_dynamic_bsz:
-            raise ValueError("teacher forward overlap currently requires one sample and fixed micro-batching")
+        if (
+            not 0 < len(data) <= (self.config.rollout.log_prob_micro_batch_size_per_gpu or 0)
+            or self.config.rollout.log_prob_use_dynamic_bsz
+        ):
+            raise ValueError("teacher forward overlap requires exactly one fixed student micro-batch")
         if data.meta_info.get("reward_mode") != "mt_opd" or data.meta_info.get("log_prob_top_k", 0) <= 0:
             raise ValueError("teacher forward overlap currently requires MT-OPD with student top-k")
         if data.meta_info.get("is_lora", False):
             raise ValueError("teacher forward overlap does not support reference/adapter-disabled scoring")
         teacher = self.get_fused_worker_by_name("rm")
+        if len(data) > (teacher.config.micro_batch_size_per_gpu or 0):
+            raise ValueError("teacher forward overlap requires exactly one fixed teacher micro-batch")
         runner = teacher.prepare_forward_overlap()
         # Deserialized TensorDicts may retain consolidated-storage metadata.
         # Adding student tensors then calling .to() can reinterpret those tensors
@@ -1234,10 +1333,13 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
         for tensor in teacher_inputs.batch.values():
             tensor.record_stream(runner.stream)
         prefetch = teacher._teacher_handle_prefetch if self.config.rollout.teacher_param_prefetch else None
+        pipeline = getattr(teacher, "_teacher_layer_pipeline", None)
         previous_reuse = prefetch.reuse_count if prefetch is not None else None
 
         def launch_teacher():
-            if prefetch is not None:
+            if pipeline is not None:
+                pipeline.prefetch_first()
+            elif prefetch is not None:
                 if runner.last_done is not None:
                     # pre_unshard consumption is not the last GPU use of the shard.
                     prefetch.stream.wait_event(runner.last_done)
@@ -1246,15 +1348,53 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
 
         with _openmopd_nvtx("compute::student_teacher_scoring"):
             try:
-                student = self._compute_log_prob(data, teacher_forward_callback=launch_teacher)
+                cpu_pipeline = self.config.rollout.get("student_teacher_pipeline", False)
+                score_version = self.actor_optimizer.version if cpu_pipeline else None
+                if cpu_pipeline:
+                    pipeline.begin_student()
+                callback = launch_teacher
+                if cpu_pipeline and not self.config.rollout.pipeline_overlap:
+                    callback = lambda: None
+                student = self._compute_log_prob(data, teacher_forward_callback=callback)
+                if cpu_pipeline:
+                    pipeline.finish_student()
+                    if not self.config.rollout.pipeline_overlap:
+                        launch_teacher()
                 with _openmopd_nvtx("compute::teacher_logits_join"):
                     logits = runner.finish()
                 if prefetch is not None:
                     prefetch.assert_consumed(previous_reuse)
                 scoring_data = data.union(student)
                 teacher_output = teacher._compute_rm_score(scoring_data, precomputed_logits=logits)
-                return student.union(teacher_output)
+                # Release the full-vocabulary logits before the next teacher's
+                # forward. Only the compact scoring outputs need to survive.
+                del logits
+                output = student.union(teacher_output)
+                roles = sorted(
+                    (name for name in self.fused_worker_dict if name.startswith("mt_rm_")),
+                    key=lambda name: int(name.removeprefix("mt_rm_")),
+                )
+                for role in roles:
+                    extra_teacher = self.get_fused_worker_by_name(role)
+                    extra_output = extra_teacher._compute_rm_score(scoring_data)
+                    index = int(role.removeprefix("mt_rm_"))
+                    # MT-OPD consumes only this field from additional teachers.
+                    # Reuse the GPU input/top-k tensors instead of a Ray round trip.
+                    output.union(DataProto.from_dict(tensors={
+                        f"mt_teacher_{index}_on_student_log_probs": extra_output.batch["teacher_on_student_log_probs"],
+                    }))
+                    del extra_output
+                if cpu_pipeline:
+                    pipeline.finish_cycle()
+                    output.meta_info.update(
+                        opd_pipeline=True,
+                        scoring_policy_version=score_version,
+                        learner_policy_version=self.actor_optimizer.version,
+                    )
+                return output
             except BaseException:
+                if self.config.rollout.get("student_teacher_pipeline", False):
+                    pipeline.abort()
                 # The actor must not return while a background thread owns FSDP state.
                 try:
                     runner.drain()
@@ -1406,6 +1546,7 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
 
         # only support save and load ckpt for actor
         assert self._is_actor
+        self.flush_pipeline()
 
         if self._is_offload_param:
             load_fsdp_model_to_gpu(self.actor_module_fsdp)
@@ -1448,6 +1589,11 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
 
         if self._is_offload_param:
             offload_fsdp_model_to_cpu(self.actor_module_fsdp)
+
+    @register(dispatch_mode=Dispatch.ONE_TO_ALL)
+    def flush_pipeline(self):
+        if self._is_actor and self.config.rollout.get("student_teacher_pipeline", False):
+            self.actor_optimizer.flush()
 
     @register(dispatch_mode=Dispatch.ONE_TO_ALL)
     def load_checkpoint(self, local_path, remote_path=None, del_local_after_load=False):
@@ -2130,7 +2276,8 @@ class RewardModelWorker(Worker, DistProfilerExtension):
         vocab_size = original_shape[-1]
         
         # Flatten to [-1, vocab_size]
-        logits_flat = logits.view(-1, vocab_size)
+        # A response slice across multiple samples has a gap between rows.
+        logits_flat = logits.reshape(-1, vocab_size)
         
         entropy_list = []
         for i in range(0, logits_flat.size(0), chunk_size):
@@ -2260,6 +2407,7 @@ class RewardModelWorker(Worker, DistProfilerExtension):
         self.reward_module = self._build_model(config=self.config)
         self._teacher_handle_prefetch = None
         self._teacher_forward_overlap = None
+        self._teacher_layer_pipeline = None
 
     def prepare_forward_overlap(self):
         if (
@@ -2270,10 +2418,10 @@ class RewardModelWorker(Worker, DistProfilerExtension):
             or self.use_fused_kernels
             or self._do_switch_chat_template
             or self.config.use_dynamic_bsz
-            or self.config.micro_batch_size_per_gpu != 1
+            or (self.config.micro_batch_size_per_gpu or 0) < 1
         ):
             raise ValueError(
-                "teacher forward overlap requires FSDP1, one GPU, SP=1, one-sample micro-batches, "
+                "teacher forward overlap requires FSDP1, one GPU, SP=1, a positive fixed micro-batch size, "
                 "and no dynamic batching, padding removal, fused kernels, or chat-template switching"
             )
         if self._teacher_forward_overlap is None:
@@ -2298,7 +2446,11 @@ class RewardModelWorker(Worker, DistProfilerExtension):
         return output[0] if isinstance(output, tuple) else output.logits
 
     def start_param_prefetch(self, max_mb: int):
-        """Enqueue one teacher local-shard HtoD before student computation."""
+        """Prime the shared layer pool, or enqueue the legacy single-shard copy."""
+        pipeline = getattr(self, "_teacher_layer_pipeline", None)
+        if pipeline is not None:
+            pipeline.prefetch_first()
+            return
         self.prepare_param_prefetch(max_mb)
         self._teacher_handle_prefetch.start()
 
@@ -2963,9 +3115,16 @@ class RewardModelWorker(Worker, DistProfilerExtension):
 
         from verl.utils.seqlen_balancing import get_reverse_idx, rearrange_micro_batches
 
+        if getattr(self, "_teacher_layer_pipeline", None) is not None and (
+            not 0 < len(data) <= (self.config.micro_batch_size_per_gpu or 0) or self.config.use_dynamic_bsz
+        ):
+            raise ValueError("teacher layer pipeline requires exactly one fixed micro-batch per scoring call")
         if precomputed_logits is not None:
             self.prepare_forward_overlap()
-            if len(data) != 1 or precomputed_logits.shape[:2] != data.batch["input_ids"].shape:
+            if (
+                not 0 < len(data) <= (self.config.micro_batch_size_per_gpu or 0)
+                or precomputed_logits.shape[:2] != data.batch["input_ids"].shape
+            ):
                 raise ValueError("precomputed teacher logits do not match the single input micro-batch")
 
         prefetch = getattr(self, "_teacher_handle_prefetch", None)
