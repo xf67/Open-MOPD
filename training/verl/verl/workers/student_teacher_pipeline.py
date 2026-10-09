@@ -32,7 +32,8 @@ class StudentTeacherPipeline(TeacherLayerPipeline):
         self.scoring = False
         self.student_released = set()
         self.restore_executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="student-restore")
-        self.restores = []
+        self.restores = {}
+        self.teacher_root_last_use = None
         _lazy_init(models[0], models[0])
         teacher_modules = {
             n: m for n, m in models[0].named_modules()
@@ -58,20 +59,22 @@ class StudentTeacherPipeline(TeacherLayerPipeline):
         super().__init__(models, names, max_mb, slot_tensors=slots)
         self.extra_gpu_bytes = self.slots[""].tensor.nbytes
         for name, module in optimizer.modules.items():
+            self.hooks.append(module.register_forward_pre_hook(partial(self._student_acquire, name), prepend=True))
             self.hooks.append(module.register_forward_hook(partial(self._student_release, name)))
 
     def begin_student(self):
         self._check_live()
         if self.scoring or self.expected != 0 or self.active is not None:
             raise RuntimeError("previous student/teacher cycle is unfinished")
+        self.wait_for_student()
         self.optimizer.start()  # Also support fixed-input scoring without a rollout.
         self.scoring = True
         self.student_released.clear()
-        self.restores = []
+        self.restores = {}
         for slot in self.slots.values():
             slot.owner = -1
             slot.ready = None
-        self._stage(0, "")
+        self._stage(0, "", self.teacher_root_last_use)
 
     def prefetch_first(self):
         # Decoder copies are submitted by student post-hooks, never before last use.
@@ -82,27 +85,54 @@ class StudentTeacherPipeline(TeacherLayerPipeline):
         if not self.scoring:
             raise RuntimeError("teacher called outside the student scoring cycle")
 
+    def _student_acquire(self, name, module, args):
+        if self.scoring or name not in self.restores:
+            return
+        self._check_live()
+        # Wait for this layer's event to be recorded before submitting a CUDA
+        # wait. Later layers may still be copying while this one runs forward.
+        with torch.cuda.nvtx.range(f"openmopd::io::h2d::student_layer_acquire::{name or 'root'}"):
+            ready = self.restores[name].result()
+            torch.cuda.current_stream(self.device).wait_event(ready)
+
     def _student_release(self, name, module, args, output):
         if not self.scoring:
             return
         if torch.is_grad_enabled() or name in self.student_released:
             raise RuntimeError("student scoring must execute each layer once under no_grad")
         self.student_released.add(name)
+        last_use = torch.cuda.Event()
+        last_use.record(torch.cuda.current_stream(self.device))
         if name:
-            last_use = torch.cuda.Event()
-            last_use.record(torch.cuda.current_stream(self.device))
             self._stage(0, name, last_use)
+        else:
+            # Teachers have a separate root slot. Restore the student's tied
+            # embedding/head as soon as old scoring releases it, before the
+            # decoder restores. Putting root last would stall the next forward
+            # at its embedding until every decoder copy had completed.
+            self._submit_restore(name, last_use)
+
+    def _submit_restore(self, name, last_use):
+        if name in self.restores:
+            raise RuntimeError(f"student layer restored twice: {name or 'root'}")
+        future = self.restore_executor.submit(self._restore, name, last_use)
+        self.restores[name] = future
+        if not self.overlap:
+            future.result()
 
     def _stage(self, index, name, last_use=None):
         # Last teacher returns decoder slots to the new student, instead of T0.
         if index == 0 and self.active is not None and self.active[0] == len(self.names) - 1:
+            if not name:
+                # Student root was restored independently. Retain the teacher's
+                # last-use fence for the next cycle's T0 root copy, including
+                # scoring-only cycles with no intervening learner forward.
+                self.teacher_root_last_use = last_use
+                return
             with self.condition:
                 self.slots[name].owner = -1
                 self.slots[name].ready = None
-            future = self.restore_executor.submit(self._restore, name, last_use)
-            self.restores.append(future)
-            if not self.overlap:
-                future.result()
+            self._submit_restore(name, last_use)
             return
         with self.condition:
             super()._stage(index, name, last_use)
@@ -127,9 +157,9 @@ class StudentTeacherPipeline(TeacherLayerPipeline):
                 self.optimizer.gpu_weights[name].copy_(self.optimizer.host_weights[name], non_blocking=True)
                 ready = torch.cuda.Event()
                 ready.record(self.stream)
-                self.slots[name].ready = ready
             if not self.overlap:
                 self.stream.synchronize()
+            return ready
 
     def finish_student(self):
         if self.student_released != set(self.slots):
@@ -137,13 +167,23 @@ class StudentTeacherPipeline(TeacherLayerPipeline):
             raise RuntimeError("student scoring skipped a layer")
 
     def finish_cycle(self):
-        if self.expected != 0 or len(self.restores) != len(self.slots):
+        if self.expected != 0 or set(self.restores) != set(self.slots):
             raise RuntimeError("all teachers must run before restoring the student")
-        for future in self.restores:
-            future.result()
-        torch.cuda.current_stream(self.device).wait_stream(self.stream)
+        # Publish the CPU version; GPU readiness is guarded by each student's
+        # pre-forward hook, rather than an all-layer barrier before training.
         self.optimizer.publish()
         self.scoring = False
+        if not self.overlap:
+            self.wait_for_student()
+
+    def wait_for_student(self):
+        """Drain restores for consumers without FSDP hooks (vLLM/checkpoints)."""
+        if self.scoring:
+            raise RuntimeError("cannot drain student weights during teacher scoring")
+        self._check_live()
+        for future in self.restores.values():
+            future.result().synchronize()
+        self.restores.clear()
 
     def abort(self):
         with self.condition:

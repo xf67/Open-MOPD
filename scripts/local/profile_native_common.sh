@@ -257,7 +257,7 @@ profile_build_command() {
     "reward_model.model.path=$(profile_hydra_string "${model_root}/Math")"
     reward_model.model.input_tokenizer=null
     +reward_model.reward_kwargs.compute_true_reward=false
-    '+mt_opd.teacher_domains=[math,code]' +mt_opd.n_additional_teachers=1
+    '+mt_opd.teacher_domains=[math,code,if]' +mt_opd.n_additional_teachers=2
     trainer.n_gpus_per_node="${num_gpus}" trainer.nnodes=1 trainer.total_epochs=1
     trainer.total_training_steps="${num_steps}" trainer.val_before_train="${val_before_train}"
     trainer.resume_mode=disable
@@ -270,6 +270,11 @@ profile_build_command() {
     +mt_reward_model_1.model.input_tokenizer=null
     +mt_reward_model_1.model.use_remove_padding=True
     +mt_reward_model_1.model.fsdp_config.param_offload=True
+    +mt_reward_model_2.enable=True
+    "+mt_reward_model_2.model.path=$(profile_hydra_string "${model_root}/IF")"
+    +mt_reward_model_2.model.input_tokenizer=null
+    +mt_reward_model_2.model.use_remove_padding=True
+    +mt_reward_model_2.model.fsdp_config.param_offload=True
     global_profiler.tool="${profile_tool}"
     "global_profiler.steps=[${profile_steps_csv}]"
     actor_rollout_ref.actor.profiler.enable=true

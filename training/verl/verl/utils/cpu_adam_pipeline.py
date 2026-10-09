@@ -306,11 +306,13 @@ class CPUAdamPipeline(torch.optim.Optimizer):
 
     def wait(self):
         self.start()
-        if self.future is not None:
-            self.future.result()
+        # Publication can clear self.future while a layer-restore thread waits.
+        future = self.future
+        if future is not None:
+            future.result()
 
     def publish(self):
-        """Called only after the slot manager has ordered all weight copies."""
+        """Publish the CPU version; GPU consumers must still await their copies."""
         if self.future is not None or self.pending is not None:
             self.wait()
             self.future = None

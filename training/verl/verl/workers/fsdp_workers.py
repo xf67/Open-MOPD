@@ -785,6 +785,9 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
 
     async def rollout_mode(self):
         """Context switch hybridengine to rollout mode."""
+        pipeline = getattr(self, "_scoring_layer_pipeline", None)
+        if self.config.rollout.get("student_teacher_pipeline", False) and pipeline is not None:
+            pipeline.wait_for_student()
         # The CPU pipeline has a pending D2H gradient copy. empty_cache and a
         # device-wide sync here would serialize that copy with the next rollout.
         if not self.config.rollout.get("student_teacher_pipeline", False):
@@ -1600,6 +1603,9 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
     @register(dispatch_mode=Dispatch.ONE_TO_ALL)
     def flush_pipeline(self):
         if self._is_actor and self.config.rollout.get("student_teacher_pipeline", False):
+            pipeline = getattr(self, "_scoring_layer_pipeline", None)
+            if pipeline is not None:
+                pipeline.wait_for_student()
             self.actor_optimizer.flush()
 
     @register(dispatch_mode=Dispatch.ONE_TO_ALL)
