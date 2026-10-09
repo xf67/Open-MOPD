@@ -16,6 +16,7 @@
 import gc
 import inspect
 import logging
+import math
 import os
 from datetime import datetime
 from pathlib import Path
@@ -26,6 +27,26 @@ from verl.utils.device import get_torch_device, is_cuda_available
 
 logger = logging.getLogger(__file__)
 logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "WARN"))
+
+
+def set_gpu_memory_limit(limit_gb: float) -> None:
+    """Cap PyTorch allocations, leaving 1 GiB for CUDA/NCCL outside its allocator.
+
+    vLLM's KV budget must be limited separately. This is an allocator budget,
+    not a hardware partition; driver allocations still require device monitoring.
+    """
+    if not math.isfinite(limit_gb) or limit_gb <= 1:
+        raise ValueError("gpu_memory_limit_gb must be finite and greater than 1 GiB")
+    device = torch.cuda.current_device()
+    physical_bytes = torch.cuda.get_device_properties(device).total_memory
+    budget_bytes = min(int(limit_gb * 1024**3), physical_bytes)
+    allocator_bytes = budget_bytes - 1024**3
+    torch.cuda.set_per_process_memory_fraction(allocator_bytes / physical_bytes, device)
+    logger.warning(
+        "GPU budget %.2f GiB: PyTorch allocator %.2f GiB, CUDA/NCCL headroom 1 GiB",
+        budget_bytes / 1024**3, allocator_bytes / 1024**3,
+    )
+
 
 # 这个的gc collect很慢，下面注释掉了
 def aggressive_empty_cache(force_sync: bool = True, max_retries: int = 3) -> None:

@@ -31,6 +31,10 @@ cpu_optimizer_threads: 8
 # Transfer and release each completed FSDP layer's gradient during backward.
 pipeline_gradient_offload: true
 
+# Optional single-GPU budget in GiB, including 1 GiB of non-PyTorch headroom.
+# Also scales vLLM's utilization budget to this capacity. Not a hardware partition.
+gpu_memory_limit_gb: null
+
 # Sampling temperature for rollout.
 temperature: 1.0
 

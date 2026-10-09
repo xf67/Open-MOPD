@@ -15,8 +15,8 @@ Common environment:
   CUDA_DEVICE_MAX_CONNECTIONS       CUDA work queues, also forwarded to Ray (default: 8)
   SHARE_STUDENT_WEIGHTS             Share BF16 actor/vLLM weights (default: true)
   BF16_STUDENT_WEIGHTS              Use BF16 when sharing is disabled (default: true)
-  OPTIMIZER_OFFLOAD_PER_LAYER       Stage optimizer states per layer (default: true)
-  STUDENT_TEACHER_PIPELINE          CPU Adam + shared student/teacher slots (default: false)
+  OPTIMIZER_OFFLOAD_PER_LAYER       Stage optimizer states per layer (default: false with CPU pipeline)
+  STUDENT_TEACHER_PIPELINE          CPU Adam + shared student/teacher slots (default: true)
   PIPELINE_OVERLAP                  Overlap CPU/copies; false is serial reference (default: true)
   CPU_OPTIMIZER_THREADS             CPU Adam worker threads (default: 8)
   PIPELINE_GRADIENT_OFFLOAD        Offload completed gradients during backward (default: true)
@@ -26,6 +26,10 @@ Common environment:
   TEACHER_FORWARD_OVERLAP           Overlap student/teacher scoring (default: true)
   OPENMOPD_N_GPUS_PER_NODE          GPU count (default: 1)
   OPENMOPD_TRAIN_BATCH_SIZE         Train and PPO minibatch size (default: GPU count)
+  OPENMOPD_GPU_MEMORY_LIMIT_GB      Single-GPU budget in GiB (default: 24; 1 GiB non-PyTorch headroom)
+  OPENMOPD_KV_CACHE_MB              Fixed vLLM KV cache in MiB (default: 4096)
+  OPENMOPD_MAX_NUM_SEQS             Maximum concurrent generation sequences (default: 8)
+  OPENMOPD_VAL_BATCH_SIZE           Validation prompts per batch (default: 8)
   OPENMOPD_PROFILE_STEP             First profiled/exported step (default: 3)
   OPENMOPD_PROFILE_STEP_COUNT       Consecutive steps (default: 2)
   OPENMOPD_NUM_STEPS                Total training steps (default: last profile step)
@@ -109,6 +113,10 @@ profile_init() {
   export CUDA_DEVICE_MAX_CONNECTIONS="${CUDA_DEVICE_MAX_CONNECTIONS:-8}"
   num_gpus="${OPENMOPD_N_GPUS_PER_NODE:-1}"
   train_batch_size="${OPENMOPD_TRAIN_BATCH_SIZE:-${num_gpus}}"
+  gpu_memory_limit_gb="${OPENMOPD_GPU_MEMORY_LIMIT_GB:-24}"
+  kv_cache_mb="${OPENMOPD_KV_CACHE_MB:-4096}"
+  max_num_seqs="${OPENMOPD_MAX_NUM_SEQS:-8}"
+  val_batch_size="${OPENMOPD_VAL_BATCH_SIZE:-8}"
   profile_step="${OPENMOPD_PROFILE_STEP:-3}"
   profile_step_count="${OPENMOPD_PROFILE_STEP_COUNT:-2}"
   val_before_train="${OPENMOPD_VAL_BEFORE_TRAIN:-true}"
@@ -126,10 +134,20 @@ profile_init() {
     [[ "${!var}" == true || "${!var}" == false ]] || profile_die "${var} must be true or false"
   done
   for var in num_gpus train_batch_size profile_step profile_step_count \
-    TEACHER_PARAM_PREFETCH_MAX_MB CUDA_DEVICE_MAX_CONNECTIONS CPU_OPTIMIZER_THREADS; do
+    TEACHER_PARAM_PREFETCH_MAX_MB CUDA_DEVICE_MAX_CONNECTIONS CPU_OPTIMIZER_THREADS \
+    gpu_memory_limit_gb kv_cache_mb max_num_seqs val_batch_size; do
     [[ "${!var}" =~ ^[1-9][0-9]*$ ]] || profile_die "${var} must be a positive integer"
   done
   [[ "${sample_ms}" =~ ^(0|[1-9][0-9]*)$ ]] || profile_die "OPENMOPD_MEMORY_SAMPLE_MS must be non-negative"
+  ((gpu_memory_limit_gb > 1 && kv_cache_mb < (gpu_memory_limit_gb - 1) * 1024)) || \
+    profile_die "GPU budget must exceed 1 GiB plus the KV cache"
+  ((num_gpus == 1)) || profile_die "The GPU memory budget currently requires one GPU"
+  local capture_size
+  cudagraph_sizes_csv=1
+  for ((capture_size = 2; capture_size < max_num_seqs; capture_size *= 2)); do
+    cudagraph_sizes_csv+=",${capture_size}"
+  done
+  if ((max_num_seqs > 1)); then cudagraph_sizes_csv+=",${max_num_seqs}"; fi
   ((train_batch_size % num_gpus == 0)) || profile_die "Train batch size must be divisible by GPU count"
   if ((num_gpus > 1)) && [[ "${SHARE_STUDENT_WEIGHTS}" == true ]]; then
     profile_die "Shared weights require one GPU; set SHARE_STUDENT_WEIGHTS=false"
@@ -205,10 +223,16 @@ profile_build_command() {
     "data.train_files=$(profile_hydra_string "${model_root}/data/rl_prompt_mix/train.parquet")"
     "data.val_files=$(profile_hydra_string "${model_root}/data/rl_prompt_mix/eval.parquet")"
     data.train_batch_size="${train_batch_size}" data.max_prompt_length=1024 data.max_response_length=4096
+    data.val_batch_size="${val_batch_size}"
     data.filter_overlong_prompts=True data.truncation=error
     "actor_rollout_ref.model.path=$(profile_hydra_string "${model_root}/MixSFT")"
     actor_rollout_ref.rollout.name=vllm
     actor_rollout_ref.rollout.share_weights="${SHARE_STUDENT_WEIGHTS}"
+    actor_rollout_ref.rollout.gpu_memory_limit_gb="${gpu_memory_limit_gb}"
+    "+actor_rollout_ref.rollout.engine_kwargs.vllm.kv_cache_memory_bytes=$((kv_cache_mb * 1024 * 1024))"
+    actor_rollout_ref.rollout.max_num_seqs="${max_num_seqs}"
+    actor_rollout_ref.rollout.cudagraph_capture_sizes="[${cudagraph_sizes_csv}]"
+    actor_rollout_ref.rollout.max_num_batched_tokens=5120
     actor_rollout_ref.rollout.teacher_param_prefetch="${TEACHER_PARAM_PREFETCH}"
     actor_rollout_ref.rollout.teacher_param_prefetch_max_mb="${TEACHER_PARAM_PREFETCH_MAX_MB}"
     actor_rollout_ref.rollout.teacher_forward_overlap="${TEACHER_FORWARD_OVERLAP}"
@@ -282,6 +306,8 @@ profile_build_command() {
   cmd+=("${profile_overrides[@]}")
   printf 'CUDA_VISIBLE_DEVICES=%s; profile steps=[%s]; output=%s\n' \
     "${CUDA_VISIBLE_DEVICES}" "${profile_steps_csv}" "${run_dir}"
+  printf 'GPU budget=%s GiB; KV cache=%s MiB; max sequences=%s; validation batch=%s\n' \
+    "${gpu_memory_limit_gb}" "${kv_cache_mb}" "${max_num_seqs}" "${val_batch_size}"
   printf 'Teacher prefetch=%s; cap=%s MiB; forward overlap=%s; optimizer per layer=%s; CUDA connections=%s\n' \
     "${TEACHER_PARAM_PREFETCH}" "${TEACHER_PARAM_PREFETCH_MAX_MB}" "${TEACHER_FORWARD_OVERLAP}" \
     "${OPTIMIZER_OFFLOAD_PER_LAYER}" "${CUDA_DEVICE_MAX_CONNECTIONS}"

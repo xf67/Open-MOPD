@@ -209,6 +209,10 @@ class RolloutConfig(BaseConfig):
     cpu_optimizer_threads: int = 8
     pipeline_gradient_offload: bool = True
 
+    # Single-GPU process budget; reserves 1 GiB outside the PyTorch allocator.
+    # vLLM utilization is computed against this capacity instead of the full GPU.
+    gpu_memory_limit_gb: Optional[float] = None
+
     # Diagnostic-only switch for a preloaded vLLM engine.  It leaves the
     # checkpoint-loaded weights untouched for the first rollout transition,
     # allowing validation to distinguish checkpoint loading from the online

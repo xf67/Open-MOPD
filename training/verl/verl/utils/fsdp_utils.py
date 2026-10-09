@@ -159,7 +159,7 @@ def get_fsdp_wrap_policy(module, config=None, is_lora=False):
 
 
 def release_fsdp_cpu_offloaded_param_views(model: nn.Module):
-    """Release stale GPU parameter views after an FSDP1 inference forward.
+    """Release stale GPU parameter views after FSDP1 construction or inference.
 
     With NO_SHARD, CPU offload, and use_orig_params=False, FSDP restores the
     flat parameter to its CPU local shard after forward but leaves the module
@@ -167,8 +167,10 @@ def release_fsdp_cpu_offloaded_param_views(model: nn.Module):
     copy, including tied parameters, without another device-to-host transfer.
     The next FSDP forward recreates the GPU views through its normal unshard.
 
-    Call only after a no-grad forward has returned. Refreshing views while an
-    autograd graph or a forward/backward operation is in use is unsafe. Other
+    Construction with CPU offload has the same stale-view behavior. Call under
+    no_grad after construction or after a no-grad forward has returned.
+    Refreshing views while an autograd graph or a forward/backward operation
+    is in use is unsafe. Other
     FSDP configurations, FSDP2, and unwrapped models are left alone.
     """
     if not isinstance(model, FSDP):
@@ -180,7 +182,7 @@ def release_fsdp_cpu_offloaded_param_views(model: nn.Module):
         if handle is None or handle.uses_sharded_strategy or not handle._offload_params or handle._use_orig_params:
             continue
         if handle._training_state != HandleTrainingState.IDLE or handle.flat_param.device.type != "cpu":
-            raise RuntimeError("FSDP inference must finish CPU offloading before releasing parameter views")
+            raise RuntimeError("FSDP must be idle with CPU parameters before releasing parameter views")
         handle._use_unsharded_views(as_params=False)
 
 

@@ -479,6 +479,13 @@ class vLLMRollout(BaseRollout):
         #    (which can vary across different vLLM versions);
         # - Otherwise it's the desired value we want to explicitly set.
         engine_kwargs = {key: val for key, val in engine_kwargs.items() if val is not None}
+        gpu_memory_utilization = config.gpu_memory_utilization
+        if config.gpu_memory_limit_gb is not None:
+            physical_bytes = torch.cuda.get_device_properties(torch.cuda.current_device()).total_memory
+            budget_bytes = min(int(config.gpu_memory_limit_gb * 1024**3), physical_bytes)
+            gpu_memory_utilization *= budget_bytes / physical_bytes
+            if engine_kwargs.get("kv_cache_memory_bytes", 0) >= budget_bytes:
+                raise ValueError("vLLM KV cache must be smaller than gpu_memory_limit_gb")
         if config.get("limit_images", None):  # support for multi-image data
             engine_kwargs["limit_mm_per_prompt"] = {"image": config.get("limit_images")}
 
@@ -511,7 +518,7 @@ class vLLMRollout(BaseRollout):
                 distributed_executor_backend="external_launcher",
                 dtype=config.dtype,
                 enforce_eager=config.enforce_eager,
-                gpu_memory_utilization=config.gpu_memory_utilization,
+                gpu_memory_utilization=gpu_memory_utilization,
                 disable_custom_all_reduce=True,
                 skip_tokenizer_init=False,
                 max_model_len=max_model_len,

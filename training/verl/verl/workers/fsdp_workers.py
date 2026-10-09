@@ -200,6 +200,13 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
 
         # build device mesh for FSDP
         world_size = torch.distributed.get_world_size()
+        memory_limit_gb = self.config.rollout.get("gpu_memory_limit_gb")
+        if memory_limit_gb is not None:
+            if world_size != 1 or device_name != "cuda":
+                raise ValueError("gpu_memory_limit_gb currently requires a single CUDA GPU")
+            from verl.utils.memory_utils import set_gpu_memory_limit
+
+            set_gpu_memory_limit(memory_limit_gb)
         # TODO(sgm): support FSDP hybrid shard for larger model
         self.device_mesh = create_device_mesh(world_size=world_size, fsdp_size=self.config.actor.fsdp_config.fsdp_size)
 
@@ -2253,6 +2260,12 @@ class RewardModelWorker(Worker, DistProfilerExtension):
                 forward_prefetch=self.config.model.fsdp_config.forward_prefetch,
                 device_mesh=self.device_mesh,
             )
+            # CPU offload moves flat parameters but leaves module views on the
+            # old GPU storage with use_orig_params=False. Release those before
+            # loading another teacher or vLLM, including before validation.
+            with torch.no_grad():
+                release_fsdp_cpu_offloaded_param_views(reward_module)
+            get_torch_device().empty_cache()
         elif config.strategy == "fsdp2":
             assert CPUOffloadPolicy is not None, "PyTorch version >= 2.4 is required for using fully_shard API (FSDP2)"
             cpu_offload = CPUOffloadPolicy(pin_memory=True)
