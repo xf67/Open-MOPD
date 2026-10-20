@@ -22,6 +22,12 @@ from typing import Optional
 
 from packaging import version
 
+# Transformers 5 removed the legacy vision-to-sequence auto class.
+try:
+    from transformers import AutoModelForVision2Seq as AutoModelForVision2Seq
+except ImportError:
+    from transformers import AutoModelForImageTextToText as AutoModelForVision2Seq
+
 # Handle version compatibility for flash_attn_supports_top_left_mask
 # This function was added in newer versions of transformers
 try:

@@ -399,11 +399,11 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
             AutoModel,
             AutoModelForCausalLM,
             AutoModelForImageTextToText,
-            AutoModelForVision2Seq,
         )
 
         from verl.utils.model import get_generation_config, print_model_size, update_model_config
         from verl.utils.torch_dtypes import PrecisionType
+        from verl.utils.transformers_compat import AutoModelForVision2Seq
 
         assert role in ["actor", "ref"]
 
@@ -751,6 +751,9 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
         if self._share_rollout_weights:
             actor_module = getattr(self.actor_module_fsdp, "_fsdp_wrapped_module", self.actor_module_fsdp)
             rollout_kwargs["actor_parameters"] = dict(actor_module.named_parameters(remove_duplicate=False))
+            # Existing flat storage is owned by FSDP/the CPU optimizer pipeline.
+            # The mapping may view it, but must never move its original parameters.
+            rollout_kwargs["allow_actor_weight_rebind"] = fsdp_version(self.actor_module_fsdp) == 0
         self.rollout = get_rollout_class(rollout_config.name, rollout_config.mode)(
             config=rollout_config, model_config=model_config, device_mesh=rollout_device_mesh, **rollout_kwargs
         )

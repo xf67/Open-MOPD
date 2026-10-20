@@ -86,6 +86,7 @@ from verl.workers.rollout.seed import ranked_rollout_seed
 from verl.workers.rollout.shared_weights import (
     SharedWeightBinding,
     bind_shared_weights,
+    get_vllm_packed_linear_mapping,
     validate_shared_weights as validate_shared_weight_bindings,
 )
 from verl.workers.rollout.utils import get_free_port, is_valid_ipv6_address
@@ -314,6 +315,20 @@ def _check_vllm_version_for_sleep_level():
     return vs.parse(current_version) >= vs.parse(minver)
 
 
+def _get_vllm_compilation_config(config: RolloutConfig) -> dict:
+    sizes = config.get("cudagraph_capture_sizes")
+    if config.enforce_eager or not sizes:
+        return {}
+    if not isinstance(sizes, (list, tuple, ListConfig)):
+        raise ValueError(f"cudagraph_capture_sizes must be a list, got {sizes!r}")
+    compilation_args = {"cudagraph_capture_sizes": list(sizes)}
+    if _use_compilation_mode:
+        compilation_args["mode"] = CompilationMode.VLLM_COMPILE
+    else:
+        compilation_args["level"] = CompilationLevel.PIECEWISE
+    return {"compilation_config": CompilationConfig(**compilation_args)}
+
+
 @contextmanager
 def _shared_vllm_weight_loading(bind_weights: Callable[[torch.nn.Module], None] | None):
     """Bind weights after loading, before memory profiling/compilation/graph capture.
@@ -382,9 +397,11 @@ class vLLMRollout(BaseRollout):
         device_mesh: DeviceMesh,
         *,
         actor_parameters: dict[str, torch.nn.Parameter] | None = None,
+        allow_actor_weight_rebind: bool = True,
     ):
         super().__init__(config, model_config, device_mesh)
         self._shared_weight_bindings: list[SharedWeightBinding] | None = None
+        self._allow_actor_weight_rebind = allow_actor_weight_rebind
         if config.share_weights and actor_parameters is None:
             raise ValueError("share_weights requires actor_parameters before vLLM engine initialization")
 
@@ -489,20 +506,7 @@ class vLLMRollout(BaseRollout):
         if config.get("limit_images", None):  # support for multi-image data
             engine_kwargs["limit_mm_per_prompt"] = {"image": config.get("limit_images")}
 
-        compilation_config = {}
-
-        cudagraph_capture_sizes = config.get("cudagraph_capture_sizes")
-        # enforce_eager must be False to use cudagraph
-        if not config.enforce_eager and cudagraph_capture_sizes:
-            if isinstance(cudagraph_capture_sizes, ListConfig):
-                compilation_args = {"cudagraph_capture_sizes": cudagraph_capture_sizes}
-                if _use_compilation_mode:
-                    compilation_args["mode"] = CompilationMode.VLLM_COMPILE
-                else:
-                    compilation_args["level"] = CompilationLevel.PIECEWISE
-                compilation_config["compilation_config"] = CompilationConfig(**compilation_args)
-            else:
-                logger.warning(f"cudagraph_capture_sizes must be a list, but got {cudagraph_capture_sizes}")
+        compilation_config = _get_vllm_compilation_config(config)
 
         rollout_dp_rank = device_mesh["dp"].get_local_rank()
         engine_seed = ranked_rollout_seed(config.get("seed", 0), rollout_dp_rank)
@@ -572,15 +576,23 @@ class vLLMRollout(BaseRollout):
         if self._shared_weight_bindings is not None:
             raise RuntimeError("Shared weights must not be rebound after CUDA graph capture")
 
+        packed_modules = (
+            get_vllm_packed_linear_mapping(rollout_model)
+            if is_version_ge(pkg="vllm", minver="0.25.0")
+            else {}
+        )
         self._shared_weight_bindings = bind_shared_weights(
             rollout_model,
             actor_parameters,
             required_dtype=torch.bfloat16,
+            packed_modules=packed_modules,
+            allow_actor_rebind=self._allow_actor_weight_rebind,
         )
+        logger.info("Shared weights retain %d fused QKV/GLU modules", len(packed_modules))
 
-        # Shared-mode weights deliberately use the default CUDA allocator, so
-        # dropping Parameter.data and emptying its cache safely releases the
-        # dummy vLLM copy. The KV cache remains in vLLM's sleep allocator.
+        # Shared weights use the default CUDA allocator. Reusing actor views
+        # releases dummy vLLM storage; packing independent actor parameters
+        # releases their old storage. KV cache keeps vLLM's sleep allocator.
         free_before = torch.cuda.mem_get_info()[0]
         gc.collect()
         torch.cuda.empty_cache()
@@ -591,7 +603,7 @@ class vLLMRollout(BaseRollout):
         shared_bytes = sum(param.numel() * param.element_size() for param in unique_actor_parameters.values())
         logger.warning(
             "Sharing %d actor/vLLM parameters (%.2f GiB) before CUDA graph capture; "
-            "released %.2f GiB of dummy vLLM storage",
+            "released %.2f GiB of unused parameter storage",
             len(unique_actor_parameters),
             shared_bytes / 1024**3,
             released_bytes / 1024**3,
