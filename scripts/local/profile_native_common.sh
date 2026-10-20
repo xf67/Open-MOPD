@@ -33,17 +33,19 @@ Common environment:
   OPENMOPD_PROFILE_STEP             First profiled/exported step (default: 3)
   OPENMOPD_PROFILE_STEP_COUNT       Consecutive steps (default: 2)
   OPENMOPD_NUM_STEPS                Total training steps (default: last profile step)
-  OPENMOPD_VAL_BEFORE_TRAIN          Run initial validation (default: true)
+  OPENMOPD_VAL_BEFORE_TRAIN          Run initial validation (default: false for profiling)
   OPENMOPD_MEMORY_SAMPLE_MS         Whole-device sampling interval; 0 disables (default: 100)
-  OPENMOPD_PYTHON                   Python executable (default: mopd environment)
+  OPENMOPD_PYTHON                   Python executable (default: python3 from the active environment)
   OPENMOPD_REPO_ROOT                Repository root (default: relative to this helper)
-  OPENMOPD_MODEL_ROOT               Model/data root (default: /home/xxf/Distill/models/OPD)
+  OPENMOPD_MODEL_ROOT               Model/data root (default: models beside the repository)
+                                   Both models/... and models/OPD/... layouts are supported
+  OPENMOPD_OUTPUT_ROOT              Parent of generated run directories (default: repo/output)
 
 Nsight-only options:
-  OPENMOPD_NSYS                     nsys executable (default: /usr/local/cuda-12/bin/nsys)
+  OPENMOPD_NSYS                     nsys executable (default: nsys from PATH)
   OPENMOPD_TRACE_WAIT_SECONDS       Wait for a finalized capture (default: 300)
-  OPENMOPD_NSYS_CPU_SAMPLING        process-tree or none; none also disables CPU scheduling trace
-                                  (default: process-tree; CUDA/NVTX remain enabled)
+  OPENMOPD_NSYS_CPU_SAMPLING        auto, process-tree or none (default: auto)
+                                  auto enables CPU sampling/scheduling when nsys reports support
   OPENMOPD_NSYS_SAMPLING_PERIOD     CPU reference cycles per sample, 237500..30400000 (default: 19000000)
   OPENMOPD_NSYS_SAMPLES_PER_BACKTRACE  CPU samples per call stack, 1..32 (default: 4)
 
@@ -78,6 +80,19 @@ profile_hydra_string() {
   printf '"%s"' "${value}"
 }
 
+profile_resolve_cpu_sampling() {
+  [[ "${nsys_cpu_sampling}" == auto ]] || return 0
+  nsys_cpu_environment="$(LC_ALL=C timeout --kill-after=2s 10s \
+    "${nsys_bin}" status --environment 2>&1 || true)"
+  if grep -Eq 'CPU Profiling Environment \(process-tree\):[[:space:]]*OK' <<<"${nsys_cpu_environment}"; then
+    nsys_cpu_sampling=process-tree
+  else
+    nsys_cpu_sampling=none
+    printf 'CPU profiling auto-detection did not report process-tree support; using CUDA/NVTX only.\n' >&2
+    printf '%s\n' "${nsys_cpu_environment}" >&2
+  fi
+}
+
 profile_init() {
   profile_tool="$1"
   shift
@@ -94,9 +109,13 @@ profile_init() {
 
   repo_root="${OPENMOPD_REPO_ROOT:-$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd -P)}"
   repo_root="$(realpath -m "${repo_root}")"
-  model_root="${OPENMOPD_MODEL_ROOT:-/home/xxf/Distill/models/OPD}"
-  python_bin="${OPENMOPD_PYTHON:-/home/xxf/anaconda3/envs/mopd/bin/python}"
-  nsys_bin="${OPENMOPD_NSYS:-/usr/local/cuda-12/bin/nsys}"
+  model_root="${OPENMOPD_MODEL_ROOT:-${repo_root}/../models}"
+  if [[ ! -d "${model_root}/MixSFT" && -d "${model_root}/OPD/MixSFT" ]]; then
+    model_root="${model_root}/OPD"
+  fi
+  model_root="$(realpath -m "${model_root}")"
+  python_bin="${OPENMOPD_PYTHON:-python3}"
+  nsys_bin="${OPENMOPD_NSYS:-nsys}"
   SHARE_STUDENT_WEIGHTS="${SHARE_STUDENT_WEIGHTS:-true}"
   BF16_STUDENT_WEIGHTS="${BF16_STUDENT_WEIGHTS:-true}"
   STUDENT_TEACHER_PIPELINE="${STUDENT_TEACHER_PIPELINE:-true}"
@@ -119,11 +138,12 @@ profile_init() {
   val_batch_size="${OPENMOPD_VAL_BATCH_SIZE:-8}"
   profile_step="${OPENMOPD_PROFILE_STEP:-3}"
   profile_step_count="${OPENMOPD_PROFILE_STEP_COUNT:-2}"
-  val_before_train="${OPENMOPD_VAL_BEFORE_TRAIN:-true}"
+  val_before_train="${OPENMOPD_VAL_BEFORE_TRAIN:-false}"
   sample_ms="${OPENMOPD_MEMORY_SAMPLE_MS:-100}"
   max_entries="${OPENMOPD_MEMORY_MAX_ENTRIES:-1000000}"
   trace_wait_seconds="${OPENMOPD_TRACE_WAIT_SECONDS:-300}"
-  nsys_cpu_sampling="${OPENMOPD_NSYS_CPU_SAMPLING:-process-tree}"
+  nsys_cpu_sampling="${OPENMOPD_NSYS_CPU_SAMPLING:-auto}"
+  nsys_cpu_environment=""
   nsys_sampling_period="${OPENMOPD_NSYS_SAMPLING_PERIOD:-19000000}"
   nsys_samples_per_backtrace="${OPENMOPD_NSYS_SAMPLES_PER_BACKTRACE:-4}"
 
@@ -159,8 +179,9 @@ profile_init() {
     nsys)
       prefix=native_nsys
       [[ "${trace_wait_seconds}" =~ ^(0|[1-9][0-9]*)$ ]] || profile_die "OPENMOPD_TRACE_WAIT_SECONDS must be non-negative"
-      [[ "${nsys_cpu_sampling}" == process-tree || "${nsys_cpu_sampling}" == none ]] || \
-        profile_die "OPENMOPD_NSYS_CPU_SAMPLING must be process-tree or none"
+      [[ "${nsys_cpu_sampling}" == auto || "${nsys_cpu_sampling}" == process-tree || \
+         "${nsys_cpu_sampling}" == none ]] || \
+        profile_die "OPENMOPD_NSYS_CPU_SAMPLING must be auto, process-tree or none"
       [[ "${nsys_sampling_period}" =~ ^[1-9][0-9]{0,7}$ ]] && \
         ((nsys_sampling_period >= 237500 && nsys_sampling_period <= 30400000)) || \
         profile_die "OPENMOPD_NSYS_SAMPLING_PERIOD must be an integer in 237500..30400000 reference cycles"
@@ -183,7 +204,7 @@ profile_init() {
   local step
   for ((step = profile_step; step <= profile_end_step; step++)); do profile_steps+=("${step}"); done
   profile_steps_csv="$(IFS=,; printf '%s' "${profile_steps[*]}")"
-  run_dir="${repo_root}/output/${prefix}_$(date +%Y%m%d_%H%M%S)_$$"
+  run_dir="${OPENMOPD_OUTPUT_ROOT:-${repo_root}/output}/${prefix}_$(date +%Y%m%d_%H%M%S)_$$"
   if (($# > 0)) && [[ "$1" != *=* ]]; then run_dir="$1"; shift; fi
   if [[ "${1:-}" == -- ]]; then shift; fi
   profile_overrides=("$@")
@@ -210,6 +231,7 @@ profile_init() {
     nsys_bin="$(profile_resolve_executable "${nsys_bin}")" || exit 2
     export PATH="$(dirname "${nsys_bin}"):${PATH}"
   fi
+  if [[ "${profile_tool}" == nsys ]]; then profile_resolve_cpu_sampling; fi
   export CUDA_DEVICE_ORDER=PCI_BUS_ID
   export CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-0}"
   export VLLM_USE_V1=1 TOKENIZERS_PARALLELISM=false HYDRA_FULL_ERROR=1
@@ -331,6 +353,9 @@ profile_prepare_run() {
   if [[ "${profile_tool}" == nsys ]]; then
     mkdir -p "${run_dir}/traces" "${raw_dir}"
     touch "${profile_marker}"
+    if [[ -n "${nsys_cpu_environment}" ]]; then
+      printf '%s\n' "${nsys_cpu_environment}" >"${run_dir}/nsys-environment.txt"
+    fi
   else
     mkdir -p "${run_dir}/snapshots"
   fi
@@ -344,6 +369,13 @@ profile_stop_monitor() {
     wait "${monitor_pid}" 2>/dev/null || true
     monitor_pid=""
   fi
+}
+
+profile_print_failure() {
+  printf 'Training exit=%s, tee exit=%s. A failed run may never reach profile steps [%s].\n' \
+    "${train_rc}" "${tee_rc}" "${profile_steps_csv}" >&2
+  printf 'Training errors from %s/run.log:\n' "${run_dir}" >&2
+  grep -n -E 'Traceback|^[[:alnum:]_.]*(Error|Exception):' "${run_dir}/run.log" | tail -12 >&2 || true
 }
 
 profile_run_training() {
