@@ -73,6 +73,7 @@ from packaging import version as vs
 
 from verl import DataProto
 from verl.third_party.vllm import VLLM_SLEEP_LEVEL, get_version
+from verl.third_party.vllm.transformers_compile import isolate_transformers_compile
 from verl.utils.device import is_npu_available
 from verl.utils.distributed import initialize_global_process_group_ray
 from verl.utils.model import get_lora_rank_from_adapter
@@ -514,7 +515,10 @@ class vLLMRollout(BaseRollout):
         def bind_loaded_weights(model):
             self._bind_shared_weights(model, actor_parameters)
 
-        with _shared_vllm_weight_loading(bind_loaded_weights if config.share_weights else None):
+        with (
+            isolate_transformers_compile(),
+            _shared_vllm_weight_loading(bind_loaded_weights if config.share_weights else None),
+        ):
             self.inference_engine = LLM(
                 model=model_path,
                 enable_sleep_mode=config.free_cache_engine,

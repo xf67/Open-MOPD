@@ -303,9 +303,13 @@ class RLHFDataset(Dataset):
                         if self.tool_schemas is not None:
                             apply_kwargs["tools"] = self.tool_schemas
 
-                        return len(
-                            tokenizer.apply_chat_template(doc[prompt_key], add_generation_prompt=True, **apply_kwargs)
+                        # Match __getitem__: Transformers 5 may return a
+                        # BatchEncoding from tokenized apply_chat_template, whose
+                        # len() counts fields rather than prompt tokens.
+                        raw_prompt = tokenizer.apply_chat_template(
+                            doc[prompt_key], add_generation_prompt=True, tokenize=False, **apply_kwargs
                         )
+                        return len(tokenizer(raw_prompt, add_special_tokens=False)["input_ids"])
                     except Exception:
                         print("Error processing one of the samples, skipping...")
                         traceback.print_exc()
