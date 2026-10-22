@@ -29,6 +29,7 @@ from verl.trainer.ppo.ray_trainer import RayPPOTrainer
 from verl.trainer.ppo.reward import load_reward_manager, should_use_distributed_reward
 from verl.trainer.ppo.utils import need_critic, need_reference_policy
 from verl.utils.config import validate_config
+from verl.utils.dataloader import managed_dataloaders
 from verl.utils.device import is_cuda_available
 from verl.utils.import_utils import load_extern_type
 
@@ -344,10 +345,11 @@ class TaskRunner:
             collate_fn=collate_fn,
             train_sampler=train_sampler,
         )
-        # Initialize the workers of the trainer.
-        trainer.init_workers()
-
-        trainer.fit()
+        # Ray kills actor children on exit. Join data workers while the actor is
+        # still running so its teardown cannot race the DataLoader destructor.
+        with managed_dataloaders(trainer, "train_dataloader", "val_dataloader"):
+            trainer.init_workers()
+            trainer.fit()
 
 
 def create_rl_dataset(data_paths, data_config, tokenizer, processor, is_train=True, max_samples: int = -1):

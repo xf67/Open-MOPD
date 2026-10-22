@@ -175,6 +175,73 @@ def get_vl_model_vision_tower(vl_model_instance):
     return None
 
 
+def _mopd_release_init_host_cache(label):
+    """Return idle staging allocations when the CUDA runtime exposes host-cache APIs."""
+    import ctypes
+    import gc
+
+    import psutil
+
+    if not torch.cuda.is_initialized():
+        return
+    host_stats = getattr(torch.cuda, "host_memory_stats", None)
+    empty_host_cache = getattr(torch._C, "_host_emptyCache", None)
+    if not callable(host_stats) or not callable(empty_host_cache):
+        return
+    torch.cuda.synchronize()
+    gc.collect()
+    before = host_stats()
+    empty_host_cache()
+    # Large temporary CPU tensors may also leave free pages in glibc arenas.
+    libc = ctypes.CDLL(None)
+    malloc_trim = getattr(libc, "malloc_trim", None)
+    if malloc_trim is not None:
+        malloc_trim.argtypes = [ctypes.c_size_t]
+        malloc_trim.restype = ctypes.c_int
+        malloc_trim(0)
+    after = host_stats()
+    print(
+        f"HOST_CACHE {label}: pinned_reserved_GiB="
+        f"{before['allocated_bytes.current'] / 2**30:.2f}->"
+        f"{after['allocated_bytes.current'] / 2**30:.2f}, "
+        f"pinned_active_GiB={after['active_bytes.current'] / 2**30:.2f}, "
+        f"rss_GiB={psutil.Process().memory_info().rss / 2**30:.2f}",
+        flush=True,
+    )
+
+
+@torch.no_grad()
+def _mopd_prepare_inference_teacher(model, label):
+    """Keep only pinned parameter storage for an inference-only FSDP1 teacher."""
+    from torch.distributed.fsdp._runtime_utils import _lazy_init
+
+    if not isinstance(model, FSDP):
+        raise ValueError("Inference teacher memory cleanup requires FSDP1")
+    model.eval()
+    model.requires_grad_(False)
+    _lazy_init(model, model)
+    gradient_bytes = 0
+    for module in FSDP.fsdp_modules(model):
+        handle = module._handle
+        if handle is None:
+            continue
+        flat = handle.flat_param
+        if handle.uses_sharded_strategy or not handle._offload_params or handle._use_orig_params:
+            raise ValueError("Inference teacher cleanup requires CPU-offloaded NO_SHARD with orig_params=false")
+        if flat.requires_grad or flat.device.type != "cpu" or not flat._local_shard.is_pinned():
+            raise ValueError("Inference teacher must be frozen with pinned CPU parameters")
+        # Lazy init pins _local_shard but leaves .data and module views on the
+        # previous CPU allocation. Rebind both to the identical pinned weights.
+        flat.data = flat._local_shard
+        # FSDP1 allocates this even for frozen teachers. No backward is allowed
+        # by the teacher pipeline, so a full model-sized gradient is unused.
+        gradient_bytes += flat._cpu_grad.nbytes if flat._cpu_grad is not None else 0
+        flat._cpu_grad = None
+    release_fsdp_cpu_offloaded_param_views(model)
+    _mopd_release_init_host_cache(label)
+    print(f"TEACHER_MEMORY {label}: removed_unused_gradient_GiB={gradient_bytes / 2**30:.2f}", flush=True)
+
+
 class ActorRolloutRefWorker(Worker, DistProfilerExtension):
     """
     This worker can be instantiated as a standalone actor or a standalone rollout or a standalone reference policy
@@ -704,6 +771,7 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
             actor_optimizer = None
             actor_lr_scheduler = None
 
+        _mopd_release_init_host_cache("actor/optimizer")
         return actor_module_fsdp, actor_optimizer, actor_lr_scheduler, actor_model_config
 
     def _build_rollout(self, trust_remote_code=False):
@@ -757,6 +825,7 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
         self.rollout = get_rollout_class(rollout_config.name, rollout_config.mode)(
             config=rollout_config, model_config=model_config, device_mesh=rollout_device_mesh, **rollout_kwargs
         )
+        _mopd_release_init_host_cache("rollout")
         log_gpu_memory_usage(f"After building {self.config.rollout.name} rollout", logger=logger)
 
         # Full params
@@ -1094,6 +1163,9 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
             if getattr(teacher, "_teacher_layer_pipeline", None) is not None:
                 raise ValueError("teacher layer pipeline is already initialized")
             teacher.reward_module.eval()
+            _mopd_prepare_inference_teacher(
+                teacher.reward_module, f"teacher pinned {teacher.config.model.path}"
+            )
         pipeline_type = TeacherLayerPipeline
         pipeline_kwargs = {}
         if self.config.rollout.get("student_teacher_pipeline", False):
@@ -1120,6 +1192,7 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
             max_mb=self.config.rollout.teacher_layer_pipeline_max_mb,
             **pipeline_kwargs,
         )
+        _mopd_release_init_host_cache("teacher pipeline")
         self._scoring_layer_pipeline = pipeline
         for teacher in teachers:
             teacher._teacher_layer_pipeline = pipeline
@@ -2289,6 +2362,7 @@ class RewardModelWorker(Worker, DistProfilerExtension):
             fsdp2_load_full_state_dict(reward_module, full_state, fsdp_mesh, cpu_offload)
         else:
             raise NotImplementedError(f"Unknown strategy: {config.strategy}")
+        _mopd_release_init_host_cache(f"teacher {local_path}")
         return reward_module
 
     def _compute_entropy_safe(self, logits, chunk_size=4096):
