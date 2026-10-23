@@ -83,6 +83,7 @@ from verl.utils.fsdp_utils import (
     replace_lora_wrapper,
 )
 from verl.utils.import_utils import import_external_libs
+from verl.utils.memory_monitor import memory_stage
 from verl.utils.memory_utils import aggressive_empty_cache
 from verl.utils.model import compute_position_id_with_mask, convert_weight_keys
 from verl.utils.profiler import DistProfiler, DistProfilerExtension, ProfilerConfig, log_gpu_memory_usage, simple_timer
@@ -236,7 +237,11 @@ def _mopd_prepare_inference_teacher(model, label):
         # FSDP1 allocates this even for frozen teachers. No backward is allowed
         # by the teacher pipeline, so a full model-sized gradient is unused.
         gradient_bytes += flat._cpu_grad.nbytes if flat._cpu_grad is not None else 0
-        flat._cpu_grad = None
+        # FSDP pre-forward recreates a model-sized pinned gradient when this is
+        # None, even for frozen no-grad teachers. A zero-storage sentinel keeps
+        # that inference-only buffer disabled across forwards. TeacherLayerPipeline
+        # rejects grad-enabled forwards; never use this for a trainable actor.
+        flat._cpu_grad = torch.empty(0, dtype=flat.dtype, device="cpu")
     release_fsdp_cpu_offloaded_param_views(model)
     _mopd_release_init_host_cache(label)
     print(f"TEACHER_MEMORY {label}: removed_unused_gradient_GiB={gradient_bytes / 2**30:.2f}", flush=True)
@@ -1005,6 +1010,7 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
         get_torch_device().set_rng_state(self.torch_random_states)
 
     @register(dispatch_mode=Dispatch.ONE_TO_ALL)
+    @memory_stage("init_model")
     def init_model(self):
         from verl.workers.actor import DataParallelPPOActor
 
@@ -1136,6 +1142,7 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
                 raise ValueError("teacher forward overlap requires a colocated primary reward worker")
             teacher.prepare_forward_overlap()
 
+    @memory_stage("prepare_teacher_layer_pipeline")
     def prepare_teacher_layer_pipeline(self):
         """Connect colocated teachers in the same order used by MT-OPD scoring."""
         if self.world_size != 1 or self.ulysses_sequence_parallel_size != 1:
@@ -1203,6 +1210,7 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
 
     @register(dispatch_mode=make_nd_compute_dataproto_dispatch_fn(mesh_name="actor"))
     @DistProfiler.annotate(color="red", role="actor_update")
+    @memory_stage("update_actor")
     def update_actor(self, data: DataProto):
         assert self._is_actor
         if self._is_offload_param:
@@ -1258,6 +1266,7 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
 
     @register(dispatch_mode=make_nd_compute_dataproto_dispatch_fn(mesh_name="rollout"))
     @DistProfiler.annotate(color="red", role="rollout_generate")
+    @memory_stage("generate_sequences")
     def generate_sequences(self, prompts: DataProto):
         # Support all hardwares
         assert self._is_rollout
@@ -1314,6 +1323,7 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
 
     @register(dispatch_mode=make_nd_compute_dataproto_dispatch_fn(mesh_name="actor"))
     @DistProfiler.annotate(color="blue", role="actor_compute_log_prob")
+    @memory_stage("compute_log_prob")
     def compute_log_prob(self, data: DataProto):
         return self._compute_log_prob(data)
 
@@ -1388,6 +1398,7 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
         return output
 
     @register(dispatch_mode=make_nd_compute_dataproto_dispatch_fn(mesh_name="actor"))
+    @memory_stage("compute_log_prob_and_teacher")
     def compute_log_prob_and_teacher(self, data: DataProto):
         """Overlap student/primary forwards, then score colocated MT teachers before returning."""
         if not self.config.rollout.get("teacher_forward_overlap", False):
@@ -2088,6 +2099,7 @@ class CriticWorker(Worker, DistProfilerExtension):
         return critic_module, critic_optimizer, critic_lr_scheduler
 
     @register(dispatch_mode=Dispatch.ONE_TO_ALL)
+    @memory_stage("init_model")
     def init_model(self):
         # This is used to import external_lib into the huggingface systems
         import_external_libs(self.config.model.get("external_lib", None))
@@ -2497,6 +2509,7 @@ class RewardModelWorker(Worker, DistProfilerExtension):
                 torch.cat(teacher_in_student_list, dim=0))
 
     @register(dispatch_mode=Dispatch.ONE_TO_ALL)
+    @memory_stage("init_model")
     def init_model(self):
         # This is used to import external_lib into the huggingface systems
         import_external_libs(self.config.model.get("external_lib", None))

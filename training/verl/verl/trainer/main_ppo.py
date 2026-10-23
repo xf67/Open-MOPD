@@ -32,6 +32,7 @@ from verl.utils.config import validate_config
 from verl.utils.dataloader import managed_dataloaders
 from verl.utils.device import is_cuda_available
 from verl.utils.import_utils import load_extern_type
+from verl.utils.memory_monitor import memory_stage
 
 
 @hydra.main(config_path="config", config_name="ppo_trainer", version_base=None)
@@ -45,6 +46,7 @@ def main(config):
 
 
 # Define a function to run the PPO-like training process
+@memory_stage("driver_run")
 def run_ppo(config, task_runner_class=None) -> None:
     """Initialize Ray cluster and run distributed PPO training process.
 
@@ -234,6 +236,7 @@ class TaskRunner:
             self.role_worker_mapping[Role.RefPolicy] = ray.remote(ref_policy_cls)
             self.mapping[Role.RefPolicy] = "global_pool"
 
+    @memory_stage("task_runner")
     def run(self, config):
         """Execute the main PPO training workflow.
 

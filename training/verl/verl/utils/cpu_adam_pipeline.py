@@ -21,9 +21,12 @@ from functools import partial
 
 import torch
 
+from verl.utils.memory_monitor import memory_stage, start_memory_monitor
+
 
 def _cpu_adam_worker(connection, groups, states, gradients, threads):
     """CPUAdam's ordinary C++ binding holds the GIL: use a spawned process."""
+    start_memory_monitor()
     try:
         from deepspeed.ops.adam import DeepSpeedCPUAdam
 
@@ -276,6 +279,7 @@ class CPUAdamPipeline(torch.optim.Optimizer):
         self.pending = None
 
     @torch.no_grad()
+    @memory_stage("cpu_adam_update")
     def _update(self, ready, live, options, scale):
         with torch.cuda.device(self.device):
             with torch.cuda.nvtx.range("openmopd::cpu::optimizer_wait_gradients"):
