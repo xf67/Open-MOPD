@@ -21,7 +21,7 @@ done
 
 repo_root="${OPENMOPD_REPO_ROOT:-$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)}"
 python_bin="${OPENMOPD_PYTHON:-python3}"
-run_dir="${repo_root}/output"
+checkpoint_dir="${repo_root}/ckpt"
 
 # Support both models/OPD/... and models/... layouts.
 model_root="${OPENMOPD_MODEL_ROOT:-/home/xxf/Distill/models}"
@@ -65,6 +65,7 @@ gpu_memory_limit_gb="${OPENMOPD_GPU_MEMORY_LIMIT_GB:-24}"
 kv_cache_mb="${OPENMOPD_KV_CACHE_MB:-4096}"
 max_num_seqs="${OPENMOPD_MAX_NUM_SEQS:-8}"
 val_batch_size="${OPENMOPD_VAL_BATCH_SIZE:-8}"
+val_reward_workers="${OPENMOPD_VAL_REWARD_WORKERS:-8}"
 val_before_train="${OPENMOPD_VAL_BEFORE_TRAIN:-true}"
 # Keep r2.sh's full-epoch default instead of the profiler's four-step capture.
 num_steps="${OPENMOPD_NUM_STEPS:-null}"
@@ -76,7 +77,7 @@ for var in SHARE_STUDENT_WEIGHTS BF16_STUDENT_WEIGHTS OPTIMIZER_OFFLOAD_PER_LAYE
 done
 for var in num_gpus train_batch_size \
   TEACHER_PARAM_PREFETCH_MAX_MB CUDA_DEVICE_MAX_CONNECTIONS CPU_OPTIMIZER_THREADS \
-  gpu_memory_limit_gb kv_cache_mb max_num_seqs val_batch_size; do
+  gpu_memory_limit_gb kv_cache_mb max_num_seqs val_batch_size val_reward_workers; do
   [[ "${!var}" =~ ^[1-9][0-9]*$ ]] || die "${var} must be a positive integer"
 done
 ((gpu_memory_limit_gb > 1 && kv_cache_mb < (gpu_memory_limit_gb - 1) * 1024)) || \
@@ -141,13 +142,17 @@ cmd=("${python_bin}" -m verl.trainer.main_ppo
   "reward_model.model.path=$(hydra_string "${model_root}/Math")"
   reward_model.model.input_tokenizer=null
   +reward_model.reward_kwargs.compute_true_reward=false
+  +reward_model.reward_kwargs.distributed_validation=true
+  +reward_model.reward_kwargs.distributed_num_shards="${val_reward_workers}"
+  +reward_model.reward_kwargs.distributed_cpus_per_shard=1
+  +reward_model.reward_kwargs.distributed_max_workers_per_shard=1
   '+mt_opd.teacher_domains=[math,code,if]' +mt_opd.n_additional_teachers=2
   trainer.n_gpus_per_node="${num_gpus}" trainer.nnodes=1 trainer.total_epochs=1
   trainer.total_training_steps="${num_steps}" trainer.val_before_train="${val_before_train}"
   trainer.resume_mode=disable
-  "trainer.default_local_dir=$(hydra_string "${run_dir}/checkpoints")"
+  "trainer.default_local_dir=$(hydra_string "${checkpoint_dir}")"
   trainer.project_name=OpenOPD-local trainer.experiment_name=mt-opd-local
-  "trainer.logger=['console']"
+  "trainer.logger=['console','tensorboard']"
   "+ray_kwargs.ray_init.runtime_env.env_vars.CUDA_DEVICE_MAX_CONNECTIONS='${CUDA_DEVICE_MAX_CONNECTIONS}'"
   +mt_reward_model_1.enable=True
   "+mt_reward_model_1.model.path=$(hydra_string "${model_root}/Code")"
