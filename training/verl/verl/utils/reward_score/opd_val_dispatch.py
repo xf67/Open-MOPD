@@ -56,7 +56,13 @@ def reward_func(
         from verl.utils.reward_score import rllm_code_reward
 
         res = rllm_code_reward.compute_score(
-            data_source, solution_str, ground_truth, extra_info, scoring_mode="official_lcb"
+            data_source,
+            solution_str,
+            ground_truth,
+            extra_info,
+            scoring_mode="official_lcb",
+            # One problem per call; parallelism belongs to the outer Ray shards.
+            lcb_worker_concurrency=1,
         )
     else:
         # math + everything else: ttrl_math

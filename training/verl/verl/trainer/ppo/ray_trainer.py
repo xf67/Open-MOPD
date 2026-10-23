@@ -1287,7 +1287,7 @@ class RayPPOTrainer:
             response_lengths = test_batch.batch["response_mask"].sum(dim=-1).cpu().tolist()
 
             # evaluate using reward_function
-            use_distributed_reward = should_use_distributed_reward(self.config)
+            use_distributed_reward = should_use_distributed_reward(self.config, is_validation=True)
             # Async-rollout inline reward: when rollout.mode=async each val trajectory was
             # already scored the moment it finished generating (per-sample reward loop wrote
             # rm_scores in-batch) via the SAME build_row_jobs/aggregate_row_results as
@@ -1755,7 +1755,9 @@ class RayPPOTrainer:
 
         # perform validation before training
         # currently, we only support validation using the reward_function.
-        can_validate = self.val_reward_fn is not None or should_use_distributed_reward(self.config)
+        can_validate = self.val_reward_fn is not None or should_use_distributed_reward(
+            self.config, is_validation=True
+        )
         if can_validate and self.config.trainer.get("val_before_train", True):
             val_metrics = self._validate()
             assert val_metrics, f"{val_metrics=}"

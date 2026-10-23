@@ -39,6 +39,7 @@ from verl.workers.reward_manager.abstract import AbstractRewardManager, RawRewar
 
 _DISTRIBUTED_REWARD_KWARGS = {
     "distributed",
+    "distributed_validation",
     "distributed_flatten_tests",
     "distributed_num_shards",
     "distributed_cpu_utilization",
@@ -81,11 +82,14 @@ def is_code_reward_config(config: DictConfig) -> bool:
     )
 
 
-def should_use_distributed_reward(config: DictConfig) -> bool:
+def should_use_distributed_reward(config: DictConfig, *, is_validation: bool = False) -> bool:
+    """Allow CPU validation scoring to run in parallel without changing OPD training."""
     if is_code_reward_config(config):
         return True
     reward_kwargs = config.reward_model.get("reward_kwargs", {}) or {}
-    return _as_bool(reward_kwargs.get("distributed", False))
+    return _as_bool(reward_kwargs.get("distributed", False)) or (
+        is_validation and _as_bool(reward_kwargs.get("distributed_validation", False))
+    )
 
 
 def should_flatten_reward_tests(config: DictConfig) -> bool:
