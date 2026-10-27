@@ -149,6 +149,14 @@ algorithm:
 # config for the trainer
 trainer:
 
+  # Generation -> scoring -> update/offload peaks (FSDP synchronous rollout).
+  # This does not disable the student/teacher pipeline's asynchronous updates.
+  step_memory:
+    enabled: true
+    interval_s: 0.5
+    # PSS of actor worker + descendants; 0 disables this more expensive sample.
+    pss_interval_s: 10.0
+
   # Whether to balance batch sizes across distributed workers
   balance_batch: True
 

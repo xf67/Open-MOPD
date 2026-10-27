@@ -79,6 +79,7 @@ from verl.utils.distributed import initialize_global_process_group_ray
 from verl.utils.model import get_lora_rank_from_adapter
 from verl.utils.profiler import GPUMemoryLogger
 from verl.utils.ray_utils import ray_noset_visible_devices
+from verl.utils.step_memory import memory_transition
 from verl.utils.torch_functional import get_response_mask, pad_2d_list_to_length
 from verl.utils.vllm import TensorLoRARequest, VLLMHijack, is_version_ge
 from verl.workers.config import HFModelConfig, RolloutConfig
@@ -823,7 +824,12 @@ class vLLMRollout(BaseRollout):
             return
 
         tag_name = "+".join(tags)
-        with torch.cuda.nvtx.range(f"openmopd::memory::vllm_wake_impl::{tag_name}"):
+        # Separate selective weight/KV-cache wakes in the training metrics.
+        metric_name = "vllm_wake_" + "_".join(sorted(set(tags)))
+        with (
+            torch.cuda.nvtx.range(f"openmopd::memory::vllm_wake_impl::{tag_name}"),
+            memory_transition(metric_name),
+        ):
             if "tags" in inspect.signature(self.inference_engine.wake_up).parameters:
                 self.inference_engine.wake_up(tags=tags)
             else:
@@ -837,7 +843,10 @@ class vLLMRollout(BaseRollout):
         if not self.config.free_cache_engine:
             return
 
-        with torch.cuda.nvtx.range(f"openmopd::memory::vllm_sleep_level_{self.sleep_level}"):
+        with (
+            torch.cuda.nvtx.range(f"openmopd::memory::vllm_sleep_level_{self.sleep_level}"),
+            memory_transition("vllm_sleep"),
+        ):
             self.inference_engine.sleep(level=self.sleep_level)
 
     async def update_weights(self, weights: Generator[tuple[str, torch.Tensor], None, None], **kwargs):

@@ -85,6 +85,7 @@ from verl.utils.fsdp_utils import (
 from verl.utils.import_utils import import_external_libs
 from verl.utils.memory_monitor import memory_stage
 from verl.utils.memory_utils import aggressive_empty_cache
+from verl.utils.step_memory import memory_phase
 from verl.utils.model import compute_position_id_with_mask, convert_weight_keys
 from verl.utils.profiler import DistProfiler, DistProfilerExtension, ProfilerConfig, log_gpu_memory_usage, simple_timer
 from verl.utils.profiler.performance import reduce_timing, topk_reduce_ratio_min_max
@@ -1211,6 +1212,7 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
     @register(dispatch_mode=make_nd_compute_dataproto_dispatch_fn(mesh_name="actor"))
     @DistProfiler.annotate(color="red", role="actor_update")
     @memory_stage("update_actor")
+    @memory_phase("update")
     def update_actor(self, data: DataProto):
         assert self._is_actor
         if self._is_offload_param:
@@ -1267,6 +1269,7 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
     @register(dispatch_mode=make_nd_compute_dataproto_dispatch_fn(mesh_name="rollout"))
     @DistProfiler.annotate(color="red", role="rollout_generate")
     @memory_stage("generate_sequences")
+    @memory_phase("generation")
     def generate_sequences(self, prompts: DataProto):
         # Support all hardwares
         assert self._is_rollout
@@ -1324,6 +1327,7 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
     @register(dispatch_mode=make_nd_compute_dataproto_dispatch_fn(mesh_name="actor"))
     @DistProfiler.annotate(color="blue", role="actor_compute_log_prob")
     @memory_stage("compute_log_prob")
+    @memory_phase("scoring")
     def compute_log_prob(self, data: DataProto):
         return self._compute_log_prob(data)
 
@@ -1399,6 +1403,7 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
 
     @register(dispatch_mode=make_nd_compute_dataproto_dispatch_fn(mesh_name="actor"))
     @memory_stage("compute_log_prob_and_teacher")
+    @memory_phase("scoring")
     def compute_log_prob_and_teacher(self, data: DataProto):
         """Overlap student/primary forwards, then score colocated MT teachers before returning."""
         if not self.config.rollout.get("teacher_forward_overlap", False):
@@ -1686,6 +1691,31 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
 
         if self._is_offload_param:
             offload_fsdp_model_to_cpu(self.actor_module_fsdp)
+
+    @register(dispatch_mode=Dispatch.ONE_TO_ALL)
+    def begin_step_memory(self, step: int, interval_s: float = 0.5, pss_interval_s: float = 10.0):
+        from verl.utils.step_memory import StepMemoryMonitor
+
+        try:
+            if not hasattr(self, "_step_memory"):
+                device = torch.cuda if torch.cuda.is_initialized() else None
+                self._step_memory = StepMemoryMonitor(device, interval_s, pss_interval_s)
+            self._step_memory.begin(step)
+            self._step_memory_failed = False
+        except Exception:
+            self._step_memory_failed = True
+            logger.warning("Could not start step memory statistics", exc_info=True)
+
+    @register(dispatch_mode=Dispatch.ONE_TO_ALL)
+    def finish_step_memory(self, step: int):
+        try:
+            if getattr(self, "_step_memory_failed", False):
+                return {"memory/step_sampling_errors": 1}
+            monitor = getattr(self, "_step_memory", None)
+            return monitor.finish(step) if monitor is not None else {}
+        except Exception:
+            logger.warning("Could not finish step memory statistics", exc_info=True)
+            return {"memory/step_sampling_errors": 1}
 
     @register(dispatch_mode=Dispatch.ONE_TO_ALL)
     def flush_pipeline(self):
@@ -3216,6 +3246,7 @@ class RewardModelWorker(Worker, DistProfilerExtension):
 
     @register(dispatch_mode=make_nd_compute_dataproto_dispatch_fn(mesh_name="reward"))
     @DistProfiler.annotate(color="brown")
+    @memory_phase("scoring")
     def compute_rm_score(self, data: DataProto, kl_estimator="k1"):
         return self._compute_rm_score(data, kl_estimator=kl_estimator)
 

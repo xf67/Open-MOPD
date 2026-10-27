@@ -71,6 +71,7 @@ from verl.utils.debug import marked_timer
 from verl.utils.metric import reduce_metrics
 from verl.utils.rollout_skip import RolloutSkip
 from verl.utils.seqlen_balancing import calculate_workload, get_seqlen_balanced_partitions, log_seqlen_unbalance
+from verl.utils.step_memory import reduce_step_memory_metrics
 from verl.utils.torch_functional import masked_mean
 from verl.utils.tracking import ValidationGenerationsLogger
 from verl.workers.actor.mt_opd import (
@@ -1771,6 +1772,14 @@ class RayPPOTrainer:
             rollout_skip.wrap_generate_sequences()
 
         # add tqdm
+        step_memory_config = self.config.trainer.get("step_memory", {})
+        step_memory_enabled = bool(step_memory_config.get("enabled", False))
+        if step_memory_enabled and (
+            self.async_rollout_mode or not hasattr(self.actor_rollout_wg, "begin_step_memory")
+        ):
+            print("Per-step memory logging requires the synchronous FSDP actor/rollout worker group; disabled.")
+            step_memory_enabled = False
+
         progress_bar = tqdm(total=self.total_training_steps, initial=self.global_steps, desc="Training Progress")
 
         # we start from step 1
@@ -1919,6 +1928,12 @@ class RayPPOTrainer:
                 )
 
                 is_last_step = self.global_steps >= self.total_training_steps
+                if step_memory_enabled:
+                    self.actor_rollout_wg.begin_step_memory(
+                        step=self.global_steps,
+                        interval_s=float(step_memory_config.get("interval_s", 0.5)),
+                        pss_interval_s=float(step_memory_config.get("pss_interval_s", 10.0)),
+                    )
                 with marked_timer("step", timing_raw):
                     # generate a batch
                     with marked_timer("gen", timing_raw, color="red"):
@@ -3565,6 +3580,20 @@ class RayPPOTrainer:
                 if is_last_step and self.student_teacher_pipeline:
                     with marked_timer("flush_pipeline", timing_raw):
                         self.actor_rollout_wg.flush_pipeline()
+
+                # End before checkpoint/validation so their allocations do not
+                # contaminate the training peak. Never flush asynchronous work
+                # just for telemetry; the existing final-step flush stays above.
+                if step_memory_enabled:
+                    metrics.update(
+                        reduce_step_memory_metrics(self.actor_rollout_wg.finish_step_memory(step=self.global_steps))
+                    )
+                    # Phase instrumentation also resets allocator counters.
+                    # Preserve the legacy fields as complete step peaks.
+                    for kind in ("allocated", "reserved"):
+                        key = f"memory/step_gpu_{kind}_peak_gib"
+                        if key in metrics:
+                            metrics[f"perf/max_memory_{kind}_gb"] = metrics[key]
 
                 # Check if the ESI (Elastic Server Instance)/training plan is close to expiration.
                 esi_close_to_expiration = should_save_ckpt_esi(
