@@ -12,6 +12,8 @@ while (($# > 0)); do
             printf 'Usage: bash %s [--dry-run] [Hydra overrides...]\n' "$0"
             printf 'Activate conda environment mopd first. Defaults to one epoch without profiling.\n'
             printf 'Use OPENMOPD_NUM_STEPS to limit steps; trailing Hydra overrides take precedence.\n'
+            printf 'Set STEP_MEMORY_ENABLED=false to disable step/phase memory telemetry for speed tests.\n'
+            printf 'Pinned pipeline buffers round to 2 MiB; OPENMOPD_PINNED_ALIGNMENT_MB=0 restores PyTorch allocation.\n'
             exit 0 ;;
         --) shift; break ;;
         -*) die "Unknown option: $1" ;;
@@ -51,6 +53,7 @@ STUDENT_TEACHER_PIPELINE="${STUDENT_TEACHER_PIPELINE:-true}"
 PIPELINE_OVERLAP="${PIPELINE_OVERLAP:-true}"
 CPU_OPTIMIZER_THREADS="${CPU_OPTIMIZER_THREADS:-8}"
 PIPELINE_GRADIENT_OFFLOAD="${PIPELINE_GRADIENT_OFFLOAD:-true}"
+STEP_MEMORY_ENABLED="${STEP_MEMORY_ENABLED:-true}"
 TEACHER_LAYER_PIPELINE="${TEACHER_LAYER_PIPELINE:-false}"
 optimizer_layer_default=true
 if [[ "${STUDENT_TEACHER_PIPELINE}" == true ]]; then optimizer_layer_default=false; fi
@@ -59,6 +62,8 @@ TEACHER_PARAM_PREFETCH="${TEACHER_PARAM_PREFETCH:-true}"
 TEACHER_PARAM_PREFETCH_MAX_MB="${TEACHER_PARAM_PREFETCH_MAX_MB:-768}"
 TEACHER_FORWARD_OVERLAP="${TEACHER_FORWARD_OVERLAP:-true}"
 export CUDA_DEVICE_MAX_CONNECTIONS="${CUDA_DEVICE_MAX_CONNECTIONS:-8}"
+export OPENMOPD_PINNED_ALIGNMENT_MB="${OPENMOPD_PINNED_ALIGNMENT_MB:-2}"
+[[ "${OPENMOPD_PINNED_ALIGNMENT_MB}" =~ ^[0-9]+$ ]] || die "OPENMOPD_PINNED_ALIGNMENT_MB must be a nonnegative integer"
 num_gpus="${OPENMOPD_N_GPUS_PER_NODE:-1}"
 train_batch_size="${OPENMOPD_TRAIN_BATCH_SIZE:-${num_gpus}}"
 gpu_memory_limit_gb="${OPENMOPD_GPU_MEMORY_LIMIT_GB:-24}"
@@ -72,7 +77,7 @@ num_steps="${OPENMOPD_NUM_STEPS:-null}"
 
 for var in SHARE_STUDENT_WEIGHTS BF16_STUDENT_WEIGHTS OPTIMIZER_OFFLOAD_PER_LAYER \
   TEACHER_PARAM_PREFETCH TEACHER_FORWARD_OVERLAP STUDENT_TEACHER_PIPELINE PIPELINE_OVERLAP \
-  TEACHER_LAYER_PIPELINE PIPELINE_GRADIENT_OFFLOAD val_before_train; do
+  TEACHER_LAYER_PIPELINE PIPELINE_GRADIENT_OFFLOAD STEP_MEMORY_ENABLED val_before_train; do
   [[ "${!var}" == true || "${!var}" == false ]] || die "${var} must be true or false"
 done
 for var in num_gpus train_batch_size \
@@ -104,6 +109,7 @@ export PATH="$(dirname "${python_bin}"):${PATH}"
 export PYTHONPATH="${repo_root}/training/verl${PYTHONPATH:+:${PYTHONPATH}}"
 
 cmd=("${python_bin}" -m verl.trainer.main_ppo
+  trainer.step_memory.enabled="${STEP_MEMORY_ENABLED}"
   algorithm.adv_estimator=token_reward_direct
   "data.train_files=$(hydra_string "${model_root}/data/rl_prompt_mix/train.parquet")"
   "data.val_files=$(hydra_string "${model_root}/data/rl_prompt_mix/eval.parquet")"
@@ -154,6 +160,7 @@ cmd=("${python_bin}" -m verl.trainer.main_ppo
   trainer.project_name=OpenOPD-local trainer.experiment_name=mt-opd-local
   "trainer.logger=['console','tensorboard']"
   "+ray_kwargs.ray_init.runtime_env.env_vars.CUDA_DEVICE_MAX_CONNECTIONS='${CUDA_DEVICE_MAX_CONNECTIONS}'"
+  "+ray_kwargs.ray_init.runtime_env.env_vars.OPENMOPD_PINNED_ALIGNMENT_MB='${OPENMOPD_PINNED_ALIGNMENT_MB}'"
   +mt_reward_model_1.enable=True
   "+mt_reward_model_1.model.path=$(hydra_string "${model_root}/Code")"
   +mt_reward_model_1.model.input_tokenizer=null

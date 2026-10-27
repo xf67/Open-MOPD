@@ -22,6 +22,7 @@ from functools import partial
 import torch
 
 from verl.utils.memory_monitor import memory_stage, start_memory_monitor
+from verl.utils.pinned_memory import empty_pinned_like
 
 
 def _cpu_adam_worker(connection, groups, states, gradients, threads):
@@ -92,7 +93,7 @@ class CPUAdamPipeline(torch.optim.Optimizer):
                     or not handle._use_orig_params or handle._uses_param_mixed_precision
                     or flat.dtype != torch.bfloat16):
                 raise ValueError("CPU pipeline requires BF16 NO_SHARD original parameters resident on one GPU")
-            host = torch.empty_like(flat, device="cpu", pin_memory=True)
+            host = empty_pinned_like(flat)
             host.copy_(flat)
             self.host_weights[name] = host
             self.gpu_weights[name] = flat.detach()
@@ -110,7 +111,7 @@ class CPUAdamPipeline(torch.optim.Optimizer):
                 offset = param.storage_offset() - flat.storage_offset()
                 output = host.narrow(0, offset, param.numel()).view(param.shape)
                 master = torch.nn.Parameter(output.float().share_memory_(), requires_grad=False)
-                gradient = torch.empty_like(output, pin_memory=True)
+                gradient = empty_pinned_like(output)
                 self.shared_gradients.append(torch.empty_like(master).share_memory_())
                 self.state[param] = {
                     "step": 0,

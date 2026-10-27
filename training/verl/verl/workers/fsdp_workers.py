@@ -183,6 +183,7 @@ def _mopd_release_init_host_cache(label):
     import gc
 
     import psutil
+    from verl.utils.pinned_memory import registered_pinned_stats
 
     if not torch.cuda.is_initialized():
         return
@@ -202,11 +203,14 @@ def _mopd_release_init_host_cache(label):
         malloc_trim.restype = ctypes.c_int
         malloc_trim(0)
     after = host_stats()
+    registered = registered_pinned_stats()
     print(
         f"HOST_CACHE {label}: pinned_reserved_GiB="
         f"{before['allocated_bytes.current'] / 2**30:.2f}->"
         f"{after['allocated_bytes.current'] / 2**30:.2f}, "
         f"pinned_active_GiB={after['active_bytes.current'] / 2**30:.2f}, "
+        f"pinned_registered_GiB={registered['allocated_bytes'] / 2**30:.2f}, "
+        f"pinned_total_GiB={(after['allocated_bytes.current'] + registered['allocated_bytes']) / 2**30:.2f}, "
         f"rss_GiB={psutil.Process().memory_info().rss / 2**30:.2f}",
         flush=True,
     )
@@ -216,11 +220,29 @@ def _mopd_release_init_host_cache(label):
 def _mopd_prepare_inference_teacher(model, label):
     """Keep only pinned parameter storage for an inference-only FSDP1 teacher."""
     from torch.distributed.fsdp._runtime_utils import _lazy_init
+    from verl.utils.pinned_memory import empty_pinned_like, pinned_alignment_bytes
 
     if not isinstance(model, FSDP):
         raise ValueError("Inference teacher memory cleanup requires FSDP1")
     model.eval()
     model.requires_grad_(False)
+    aligned = bool(pinned_alignment_bytes())
+    # Pin before lazy init: .pin_memory() is a no-op on an already pinned
+    # tensor. This avoids the old power-of-two parameter allocation entirely.
+    # Models initialized earlier are migrated below instead.
+    pre_pinned = aligned and model._is_root is None
+    if pre_pinned:
+        for module in FSDP.fsdp_modules(model):
+            handle = module._handle
+            if handle is None:
+                continue
+            flat = handle.flat_param
+            if (handle.uses_sharded_strategy or not handle._offload_params or handle._use_orig_params
+                    or flat.device.type != "cpu"):
+                raise ValueError("Aligned teacher buffers require CPU-offloaded NO_SHARD with orig_params=false")
+            host = empty_pinned_like(flat)
+            host.copy_(flat)
+            flat.data = host
     _lazy_init(model, model)
     gradient_bytes = 0
     for module in FSDP.fsdp_modules(model):
@@ -232,6 +254,10 @@ def _mopd_prepare_inference_teacher(model, label):
             raise ValueError("Inference teacher cleanup requires CPU-offloaded NO_SHARD with orig_params=false")
         if flat.requires_grad or flat.device.type != "cpu" or not flat._local_shard.is_pinned():
             raise ValueError("Inference teacher must be frozen with pinned CPU parameters")
+        if aligned and not pre_pinned:
+            host = empty_pinned_like(flat._local_shard)
+            host.copy_(flat._local_shard)
+            flat._local_shard = host
         # Lazy init pins _local_shard but leaves .data and module views on the
         # previous CPU allocation. Rebind both to the identical pinned weights.
         flat.data = flat._local_shard

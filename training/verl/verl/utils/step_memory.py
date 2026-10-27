@@ -9,6 +9,7 @@ we never flush the optimizer or synchronize CUDA to improve attribution.
 import functools
 import logging
 import math
+import sys
 import threading
 import time
 from contextlib import contextmanager
@@ -18,7 +19,17 @@ import psutil
 logger = logging.getLogger(__name__)
 GIB = 1024**3
 _active_monitor = None
-PHASE_VALUES = {"gpu_allocated", "gpu_reserved", "gpu_device_used", "worker_rss", "pinned_pool"}
+PHASE_VALUES = {
+    "gpu_allocated", "gpu_reserved", "gpu_device_used", "worker_rss",
+    "pinned_pool", "pinned_registered", "pinned_total",
+}
+
+
+def registered_pinned_bytes():
+    # The allocator is loaded only by pipelines using it; keep this monitor
+    # usable without importing torch/Ray, including CPU-only telemetry tests.
+    allocator = sys.modules.get("verl.utils.pinned_memory")
+    return allocator.registered_pinned_stats()["allocated_bytes"] if allocator is not None else 0
 
 
 def worker_tree_pss(process):
@@ -101,11 +112,15 @@ class StepMemoryMonitor:
             except Exception as exc:
                 self._error(exc)
             try:
+                registered = registered_pinned_bytes()
+                self._current("pinned_registered", registered, values)
                 host_stats = getattr(self.device, "host_memory_stats", None)
                 if host_stats is not None:
                     # allocated_bytes includes active + cached pinned blocks.
                     # active_bytes is unreliable on the deployed torch build.
-                    self._current("pinned_pool", host_stats()["allocated_bytes.current"], values)
+                    pool = host_stats()["allocated_bytes.current"]
+                    self._current("pinned_pool", pool, values)
+                    self._current("pinned_total", pool + registered, values)
             except Exception as exc:
                 self._error(exc)
         return values
