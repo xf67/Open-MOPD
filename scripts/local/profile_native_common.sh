@@ -12,6 +12,7 @@ Trailing Hydra overrides take precedence over the common training defaults.
 
 Common environment:
   CUDA_VISIBLE_DEVICES              GPU selection (default: 0)
+  USE_CU13                         Prefer Python environment CUDA 13 toolkit (default: false)
   CUDA_DEVICE_MAX_CONNECTIONS       CUDA work queues, also forwarded to Ray (default: 8)
   SHARE_STUDENT_WEIGHTS             Share BF16 actor/vLLM weights (default: true)
   BF16_STUDENT_WEIGHTS              Use BF16 when sharing is disabled (default: true)
@@ -42,7 +43,7 @@ Common environment:
   OPENMOPD_OUTPUT_ROOT              Parent of generated run directories (default: repo/output)
 
 Nsight-only options:
-  OPENMOPD_NSYS                     nsys executable (default: nsys from PATH)
+  OPENMOPD_NSYS                     nsys executable (default: beside Python, then PATH)
   OPENMOPD_TRACE_WAIT_SECONDS       Wait for a finalized capture (default: 300)
   OPENMOPD_NSYS_CPU_SAMPLING        auto, process-tree or none (default: auto)
                                   auto enables CPU sampling/scheduling when nsys reports support
@@ -116,6 +117,7 @@ profile_init() {
   model_root="$(realpath -m "${model_root}")"
   python_bin="${OPENMOPD_PYTHON:-python3}"
   nsys_bin="${OPENMOPD_NSYS:-nsys}"
+  USE_CU13="${USE_CU13:-false}"
   SHARE_STUDENT_WEIGHTS="${SHARE_STUDENT_WEIGHTS:-true}"
   BF16_STUDENT_WEIGHTS="${BF16_STUDENT_WEIGHTS:-true}"
   STUDENT_TEACHER_PIPELINE="${STUDENT_TEACHER_PIPELINE:-true}"
@@ -148,7 +150,7 @@ profile_init() {
   nsys_samples_per_backtrace="${OPENMOPD_NSYS_SAMPLES_PER_BACKTRACE:-4}"
 
   local var prefix override key
-  for var in SHARE_STUDENT_WEIGHTS BF16_STUDENT_WEIGHTS OPTIMIZER_OFFLOAD_PER_LAYER \
+  for var in USE_CU13 SHARE_STUDENT_WEIGHTS BF16_STUDENT_WEIGHTS OPTIMIZER_OFFLOAD_PER_LAYER \
     TEACHER_PARAM_PREFETCH TEACHER_FORWARD_OVERLAP STUDENT_TEACHER_PIPELINE PIPELINE_OVERLAP \
     TEACHER_LAYER_PIPELINE PIPELINE_GRADIENT_OFFLOAD val_before_train; do
     [[ "${!var}" == true || "${!var}" == false ]] || profile_die "${var} must be true or false"
@@ -227,6 +229,9 @@ profile_init() {
   raw_dir="${run_dir}/profile"
   profile_marker="${run_dir}/profile.started"
   python_bin="$(profile_resolve_executable "${python_bin}")" || exit 2
+  if [[ -z "${OPENMOPD_NSYS:-}" && -x "${python_bin%/*}/nsys" ]]; then
+    nsys_bin="${python_bin%/*}/nsys"
+  fi
   if [[ "${profile_tool}" == nsys && "${dry_run}" == false ]]; then
     nsys_bin="$(profile_resolve_executable "${nsys_bin}")" || exit 2
     export PATH="$(dirname "${nsys_bin}"):${PATH}"
@@ -235,6 +240,22 @@ profile_init() {
   export CUDA_DEVICE_ORDER=PCI_BUS_ID
   export CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-0}"
   export VLLM_USE_V1=1 TOKENIZERS_PARALLELISM=false HYDRA_FULL_ERROR=1
+  export PYTHONNOUSERSITE=1
+  # The shared-weight integration accesses the original v1 model runner.
+  export VLLM_USE_V2_MODEL_RUNNER="${VLLM_USE_V2_MODEL_RUNNER:-0}"
+  if [[ "${USE_CU13}" == true ]]; then
+    # Prefer the CUDA toolkit packaged with the selected Python environment.
+    local python_prefix cuda_candidate
+    python_prefix="$(cd "$(dirname "${python_bin}")/.." && pwd -P)"
+    for cuda_candidate in "${python_prefix}"/lib/python*/site-packages/nvidia/cu13; do
+      if [[ -x "${cuda_candidate}/bin/nvcc" ]]; then
+        export CUDA_HOME="${cuda_candidate}"
+        export PATH="${CUDA_HOME}/bin:${PATH}"
+        export LD_LIBRARY_PATH="${CUDA_HOME}/lib${LD_LIBRARY_PATH:+:${LD_LIBRARY_PATH}}"
+        break
+      fi
+    done
+  fi
   export PATH="$(dirname "${python_bin}"):${PATH}"
   export PYTHONPATH="${repo_root}/training/verl${PYTHONPATH:+:${PYTHONPATH}}"
 }
