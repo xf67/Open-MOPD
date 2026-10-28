@@ -25,9 +25,30 @@ teacher_layer_pipeline_max_mb: 8192
 
 # Requires shared student weights, MT-OPD only_stu, and one optimizer step per batch.
 student_teacher_pipeline: false
-# False preserves the same one-step policy lag while serializing CPU/copy work.
+
+# Enable CPU-resident FP32 AdamW state without requiring student/teacher slots.
+# Without slots, requires share_weights=true and cpu_adam_async=false.
+cpu_adam_enabled: false
+
+# null preserves legacy timing and one-step lag; false publishes in step();
+# true defers publication to scoring regardless of pipeline_overlap.
+cpu_adam_async: null
+
+# Retain FP32 reduced/staged gradients instead of casting back to BF16.
+# Requires CPUAdamPipeline and FSDP1 shared weights.
+pipeline_fp32_gradients: false
+
+# AdamW arithmetic backend: cpu (DeepSpeed CPUAdam) or cuda (PyTorch AdamW).
+# Both keep FP32 master weights/moments on CPU; CUDA stages one parameter at a time.
+pipeline_optimizer_backend: cpu
+
+# Copy/compute overlap. With cpu_adam_async=null, false preserves one-step lag
+# while waiting for optimizer work in step(); it does not publish the update.
 pipeline_overlap: true
+
+# CPU threads for the optimizer and BF16/FP32 staging.
 cpu_optimizer_threads: 8
+
 # Transfer and release each completed FSDP layer's gradient during backward.
 pipeline_gradient_offload: true
 

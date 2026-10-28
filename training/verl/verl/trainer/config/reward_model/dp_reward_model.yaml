@@ -38,8 +38,9 @@ model:
       # Minimum number of parameters to trigger wrapping
       min_num_params: 0
 
-    # Whether to offload model parameters to CPU
-    param_offload: False
+    # Teacher placement for FSDP1/FSDP2. True preserves the historically forced
+    # CPU offload; false keeps teacher parameters resident on the accelerator.
+    param_offload: True
 
     # Only for FSDP2: Reshard after forward pass to reduce memory footprint
     reshard_after_forward: True

@@ -205,6 +205,13 @@ class RolloutConfig(BaseConfig):
 
     # One-step OPD with CPU Adam and decoder slots shared by student and teachers.
     student_teacher_pipeline: bool = False
+    # Independent of slot reuse; without slots only synchronous updates are supported.
+    cpu_adam_enabled: bool = False
+    # None keeps legacy one-step lag/timing; False publishes in step(); True defers.
+    cpu_adam_async: Optional[bool] = None
+    pipeline_fp32_gradients: bool = False
+    # Arithmetic backend only; masters and moments remain FP32 CPU tensors.
+    pipeline_optimizer_backend: str = "cpu"
     pipeline_overlap: bool = True
     cpu_optimizer_threads: int = 8
     pipeline_gradient_offload: bool = True
@@ -243,6 +250,7 @@ class RolloutConfig(BaseConfig):
 
     def __post_init__(self):
         """Validate the rollout config"""
+        validate_cpu_adam_config(self)
         if self.expert_parallel_size > 1:
             assert self.expert_parallel_size == (self.tensor_model_parallel_size * self.data_parallel_size), (
                 "expert_parallel_size must be equal to tensor_model_parallel_size * data_parallel_size"
@@ -253,3 +261,27 @@ class RolloutConfig(BaseConfig):
                 raise NotImplementedError(
                     f"Current rollout {self.name=} not implemented pipeline_model_parallel_size > 1 yet."
                 )
+
+
+def validate_cpu_adam_config(config):
+    """Validate both structured configs and the worker's Hydra DictConfig."""
+    backend = config.get("pipeline_optimizer_backend", "cpu")
+    async_update = config.get("cpu_adam_async")
+    slots = config.get("student_teacher_pipeline", False)
+    enabled = slots or config.get("cpu_adam_enabled", False)
+    if backend not in ("cpu", "cuda"):
+        raise ValueError("pipeline_optimizer_backend must be 'cpu' or 'cuda'")
+    if async_update is not None and not isinstance(async_update, bool):
+        raise ValueError("cpu_adam_async must be true, false, or null")
+    if not enabled:
+        if async_update is not None or config.get("pipeline_fp32_gradients", False) or backend != "cpu":
+            raise ValueError("CPUAdam controls require cpu_adam_enabled or student_teacher_pipeline")
+        return
+    if not config.get("share_weights", False):
+        raise ValueError("CPUAdamPipeline requires share_weights=true")
+    if not slots and async_update is not False:
+        raise ValueError("independent CPUAdam requires cpu_adam_async=false")
+    if config.get("top_k_strategy", "only_stu") != "only_stu":
+        raise ValueError("CPUAdamPipeline requires OPD top_k_strategy=only_stu")
+    if config.get("cpu_optimizer_threads", 8) < 1:
+        raise ValueError("cpu_optimizer_threads must be positive")

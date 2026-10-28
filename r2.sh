@@ -12,6 +12,15 @@ while (($# > 0)); do
             printf 'Usage: bash %s [--dry-run] [Hydra overrides...]\n' "$0"
             printf 'Activate conda environment mopd first. Defaults to one epoch without profiling.\n'
             printf 'Use OPENMOPD_NUM_STEPS to limit steps; trailing Hydra overrides take precedence.\n'
+            printf 'USE_CU13=false; true prefers the CUDA 13 toolkit bundled with the selected Python environment.\n'
+            printf 'Environment: PYTHONNOUSERSITE=1; VLLM_USE_V2_MODEL_RUNNER defaults to 0.\n'
+            printf 'CPUAdam: CPU_ADAM_ENABLED=false, CPU_ADAM_ASYNC=null (true/false/null).\n'
+            printf 'Gradients/backend: PIPELINE_FP32_GRADIENTS=false, PIPELINE_OPTIMIZER_BACKEND=cpu (cpu/cuda).\n'
+            printf 'TEACHER_PARAM_OFFLOAD=true applies to all three teachers; use Hydra overrides per teacher.\n'
+            printf 'Teacher slot cap: TEACHER_LAYER_PIPELINE_MAX_MB=8192.\n'
+            printf 'Sync diagnostics: VERIFY_WEIGHT_SYNC=false, SKIP_INITIAL_WEIGHT_SYNC=false (non-shared weights).\n'
+            printf 'OPD: TOP_K_STRATEGY=only_stu, REWARD_WEIGHT_MODE=student_p, TEACHER_TEMPERATURE=1.0.\n'
+            printf 'Rollout: ENFORCE_EAGER=false, ENABLE_CHUNKED_PREFILL=true, ENABLE_PREFIX_CACHING=true, FREE_CACHE_ENGINE=true.\n'
             printf 'Set STEP_MEMORY_ENABLED=false to disable step/phase memory telemetry for speed tests.\n'
             printf 'Pinned pipeline buffers round to 2 MiB; OPENMOPD_PINNED_ALIGNMENT_MB=0 restores PyTorch allocation.\n'
             exit 0 ;;
@@ -47,17 +56,40 @@ hydra_string() {
   printf '"%s"' "${value}"
 }
 
+USE_CU13="${USE_CU13:-false}"
 SHARE_STUDENT_WEIGHTS="${SHARE_STUDENT_WEIGHTS:-true}"
+# Weight-copy diagnostics apply to the non-shared rollout path.
+VERIFY_WEIGHT_SYNC="${VERIFY_WEIGHT_SYNC:-false}"
+SKIP_INITIAL_WEIGHT_SYNC="${SKIP_INITIAL_WEIGHT_SYNC:-false}"
+ENFORCE_EAGER="${ENFORCE_EAGER:-false}"
+ENABLE_CHUNKED_PREFILL="${ENABLE_CHUNKED_PREFILL:-true}"
+ENABLE_PREFIX_CACHING="${ENABLE_PREFIX_CACHING:-true}"
+FREE_CACHE_ENGINE="${FREE_CACHE_ENGINE:-true}"
+# CPUAdam requires only_stu; the other strategies support non-CPUAdam runs.
+TOP_K_STRATEGY="${TOP_K_STRATEGY:-only_stu}"
+REWARD_WEIGHT_MODE="${REWARD_WEIGHT_MODE:-student_p}"
+TEACHER_TEMPERATURE="${TEACHER_TEMPERATURE:-1.0}"
 BF16_STUDENT_WEIGHTS="${BF16_STUDENT_WEIGHTS:-true}"
 STUDENT_TEACHER_PIPELINE="${STUDENT_TEACHER_PIPELINE:-true}"
+# Match the Hydra defaults; slot reuse also enables CPUAdam.
+CPU_ADAM_ENABLED="${CPU_ADAM_ENABLED:-false}"
+# null preserves legacy publication timing; false publishes in step().
+CPU_ADAM_ASYNC="${CPU_ADAM_ASYNC:-null}"
+PIPELINE_FP32_GRADIENTS="${PIPELINE_FP32_GRADIENTS:-false}"
+PIPELINE_OPTIMIZER_BACKEND="${PIPELINE_OPTIMIZER_BACKEND:-cpu}"
 PIPELINE_OVERLAP="${PIPELINE_OVERLAP:-true}"
 CPU_OPTIMIZER_THREADS="${CPU_OPTIMIZER_THREADS:-8}"
 PIPELINE_GRADIENT_OFFLOAD="${PIPELINE_GRADIENT_OFFLOAD:-true}"
 STEP_MEMORY_ENABLED="${STEP_MEMORY_ENABLED:-true}"
 TEACHER_LAYER_PIPELINE="${TEACHER_LAYER_PIPELINE:-false}"
+TEACHER_LAYER_PIPELINE_MAX_MB="${TEACHER_LAYER_PIPELINE_MAX_MB:-8192}"
 optimizer_layer_default=true
-if [[ "${STUDENT_TEACHER_PIPELINE}" == true ]]; then optimizer_layer_default=false; fi
+if [[ "${STUDENT_TEACHER_PIPELINE}" == true || "${CPU_ADAM_ENABLED}" == true ]]; then
+    optimizer_layer_default=false
+fi
 OPTIMIZER_OFFLOAD_PER_LAYER="${OPTIMIZER_OFFLOAD_PER_LAYER:-${optimizer_layer_default}}"
+# Shared default for the primary and both additional teachers.
+TEACHER_PARAM_OFFLOAD="${TEACHER_PARAM_OFFLOAD:-true}"
 TEACHER_PARAM_PREFETCH="${TEACHER_PARAM_PREFETCH:-true}"
 TEACHER_PARAM_PREFETCH_MAX_MB="${TEACHER_PARAM_PREFETCH_MAX_MB:-768}"
 TEACHER_FORWARD_OVERLAP="${TEACHER_FORWARD_OVERLAP:-true}"
@@ -75,12 +107,27 @@ val_before_train="${OPENMOPD_VAL_BEFORE_TRAIN:-true}"
 # Keep r2.sh's full-epoch default instead of the profiler's four-step capture.
 num_steps="${OPENMOPD_NUM_STEPS:-null}"
 
-for var in SHARE_STUDENT_WEIGHTS BF16_STUDENT_WEIGHTS OPTIMIZER_OFFLOAD_PER_LAYER \
+for var in USE_CU13 SHARE_STUDENT_WEIGHTS BF16_STUDENT_WEIGHTS OPTIMIZER_OFFLOAD_PER_LAYER \
   TEACHER_PARAM_PREFETCH TEACHER_FORWARD_OVERLAP STUDENT_TEACHER_PIPELINE PIPELINE_OVERLAP \
-  TEACHER_LAYER_PIPELINE PIPELINE_GRADIENT_OFFLOAD STEP_MEMORY_ENABLED val_before_train; do
+  TEACHER_LAYER_PIPELINE PIPELINE_GRADIENT_OFFLOAD STEP_MEMORY_ENABLED val_before_train \
+  CPU_ADAM_ENABLED PIPELINE_FP32_GRADIENTS TEACHER_PARAM_OFFLOAD \
+  VERIFY_WEIGHT_SYNC SKIP_INITIAL_WEIGHT_SYNC ENFORCE_EAGER ENABLE_CHUNKED_PREFILL \
+  ENABLE_PREFIX_CACHING FREE_CACHE_ENGINE; do
   [[ "${!var}" == true || "${!var}" == false ]] || die "${var} must be true or false"
 done
-for var in num_gpus train_batch_size \
+[[ "${CPU_ADAM_ASYNC}" == true || "${CPU_ADAM_ASYNC}" == false || "${CPU_ADAM_ASYNC}" == null ]] || \
+  die "CPU_ADAM_ASYNC must be true, false, or null"
+[[ "${PIPELINE_OPTIMIZER_BACKEND}" == cpu || "${PIPELINE_OPTIMIZER_BACKEND}" == cuda ]] || \
+  die "PIPELINE_OPTIMIZER_BACKEND must be cpu or cuda"
+case "${TOP_K_STRATEGY}" in
+  only_stu|only_tch|intersection|union|top_p_intersec) ;;
+  *) die "TOP_K_STRATEGY must be only_stu, only_tch, intersection, union, or top_p_intersec" ;;
+esac
+case "${REWARD_WEIGHT_MODE}" in
+  student_p|teacher_p|none) ;;
+  *) die "REWARD_WEIGHT_MODE must be student_p, teacher_p, or none" ;;
+esac
+for var in num_gpus train_batch_size TEACHER_LAYER_PIPELINE_MAX_MB \
   TEACHER_PARAM_PREFETCH_MAX_MB CUDA_DEVICE_MAX_CONNECTIONS CPU_OPTIMIZER_THREADS \
   gpu_memory_limit_gb kv_cache_mb max_num_seqs val_batch_size val_reward_workers; do
   [[ "${!var}" =~ ^[1-9][0-9]*$ ]] || die "${var} must be a positive integer"
@@ -105,6 +152,21 @@ python_bin="$(resolve_executable "${python_bin}")"
 export CUDA_DEVICE_ORDER=PCI_BUS_ID
 export CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-0}"
 export VLLM_USE_V1=1 TOKENIZERS_PARALLELISM=false HYDRA_FULL_ERROR=1
+export PYTHONNOUSERSITE=1
+# The shared-weight integration accesses the original v1 model runner.
+export VLLM_USE_V2_MODEL_RUNNER="${VLLM_USE_V2_MODEL_RUNNER:-0}"
+if [[ "${USE_CU13}" == true ]]; then
+    # Prefer the CUDA toolkit packaged with the selected Python environment.
+    python_prefix="$(cd "$(dirname "${python_bin}")/.." && pwd -P)"
+    for cuda_candidate in "${python_prefix}"/lib/python*/site-packages/nvidia/cu13; do
+        if [[ -x "${cuda_candidate}/bin/nvcc" ]]; then
+            export CUDA_HOME="${cuda_candidate}"
+            export PATH="${CUDA_HOME}/bin:${PATH}"
+            export LD_LIBRARY_PATH="${CUDA_HOME}/lib${LD_LIBRARY_PATH:+:${LD_LIBRARY_PATH}}"
+            break
+        fi
+    done
+fi
 export PATH="$(dirname "${python_bin}"):${PATH}"
 export PYTHONPATH="${repo_root}/training/verl${PYTHONPATH:+:${PYTHONPATH}}"
 
@@ -119,6 +181,12 @@ cmd=("${python_bin}" -m verl.trainer.main_ppo
   "actor_rollout_ref.model.path=$(hydra_string "${model_root}/MixSFT")"
   actor_rollout_ref.rollout.name=vllm
   actor_rollout_ref.rollout.share_weights="${SHARE_STUDENT_WEIGHTS}"
+  actor_rollout_ref.rollout.verify_weight_sync="${VERIFY_WEIGHT_SYNC}"
+  actor_rollout_ref.rollout.skip_initial_weight_sync="${SKIP_INITIAL_WEIGHT_SYNC}"
+  actor_rollout_ref.rollout.enforce_eager="${ENFORCE_EAGER}"
+  actor_rollout_ref.rollout.enable_chunked_prefill="${ENABLE_CHUNKED_PREFILL}"
+  actor_rollout_ref.rollout.enable_prefix_caching="${ENABLE_PREFIX_CACHING}"
+  actor_rollout_ref.rollout.free_cache_engine="${FREE_CACHE_ENGINE}"
   actor_rollout_ref.rollout.gpu_memory_limit_gb="${gpu_memory_limit_gb}"
   "+actor_rollout_ref.rollout.engine_kwargs.vllm.kv_cache_memory_bytes=$((kv_cache_mb * 1024 * 1024))"
   actor_rollout_ref.rollout.max_num_seqs="${max_num_seqs}"
@@ -128,10 +196,15 @@ cmd=("${python_bin}" -m verl.trainer.main_ppo
   actor_rollout_ref.rollout.teacher_param_prefetch_max_mb="${TEACHER_PARAM_PREFETCH_MAX_MB}"
   actor_rollout_ref.rollout.teacher_forward_overlap="${TEACHER_FORWARD_OVERLAP}"
   actor_rollout_ref.rollout.student_teacher_pipeline="${STUDENT_TEACHER_PIPELINE}"
+  actor_rollout_ref.rollout.cpu_adam_enabled="${CPU_ADAM_ENABLED}"
+  actor_rollout_ref.rollout.cpu_adam_async="${CPU_ADAM_ASYNC}"
+  actor_rollout_ref.rollout.pipeline_fp32_gradients="${PIPELINE_FP32_GRADIENTS}"
+  actor_rollout_ref.rollout.pipeline_optimizer_backend="${PIPELINE_OPTIMIZER_BACKEND}"
   actor_rollout_ref.rollout.pipeline_overlap="${PIPELINE_OVERLAP}"
   actor_rollout_ref.rollout.cpu_optimizer_threads="${CPU_OPTIMIZER_THREADS}"
   actor_rollout_ref.rollout.pipeline_gradient_offload="${PIPELINE_GRADIENT_OFFLOAD}"
   actor_rollout_ref.rollout.teacher_layer_pipeline="${TEACHER_LAYER_PIPELINE}"
+  actor_rollout_ref.rollout.teacher_layer_pipeline_max_mb="${TEACHER_LAYER_PIPELINE_MAX_MB}"
   +actor_rollout_ref.rollout.reward_mode=mt_opd
   actor_rollout_ref.rollout.n=1 actor_rollout_ref.rollout.max_model_len=5120
   actor_rollout_ref.actor.ppo_mini_batch_size="${train_batch_size}"
@@ -142,11 +215,15 @@ cmd=("${python_bin}" -m verl.trainer.main_ppo
   actor_rollout_ref.rollout.tensor_model_parallel_size=1
   actor_rollout_ref.rollout.log_prob_micro_batch_size_per_gpu=1
   +actor_rollout_ref.rollout.log_prob_top_k=256
+  +actor_rollout_ref.rollout.top_k_strategy="${TOP_K_STRATEGY}"
+  +actor_rollout_ref.rollout.reward_weight_mode="${REWARD_WEIGHT_MODE}"
+  +actor_rollout_ref.rollout.teacher_temperature="${TEACHER_TEMPERATURE}"
   "custom_reward_function.path=$(hydra_string "${repo_root}/training/verl/verl/utils/reward_score/opd_val_dispatch.py")"
   custom_reward_function.name=reward_func
   reward_model.micro_batch_size_per_gpu=1 reward_model.enable=True
   "reward_model.model.path=$(hydra_string "${model_root}/Math")"
   reward_model.model.input_tokenizer=null
+  reward_model.model.fsdp_config.param_offload="${TEACHER_PARAM_OFFLOAD}"
   +reward_model.reward_kwargs.compute_true_reward=false
   +reward_model.reward_kwargs.distributed_validation=true
   +reward_model.reward_kwargs.distributed_num_shards="${val_reward_workers}"
@@ -165,12 +242,12 @@ cmd=("${python_bin}" -m verl.trainer.main_ppo
   "+mt_reward_model_1.model.path=$(hydra_string "${model_root}/Code")"
   +mt_reward_model_1.model.input_tokenizer=null
   +mt_reward_model_1.model.use_remove_padding=True
-  +mt_reward_model_1.model.fsdp_config.param_offload=True
+  +mt_reward_model_1.model.fsdp_config.param_offload="${TEACHER_PARAM_OFFLOAD}"
   +mt_reward_model_2.enable=True
   "+mt_reward_model_2.model.path=$(hydra_string "${model_root}/IF")"
   +mt_reward_model_2.model.input_tokenizer=null
   +mt_reward_model_2.model.use_remove_padding=True
-  +mt_reward_model_2.model.fsdp_config.param_offload=True
+  +mt_reward_model_2.model.fsdp_config.param_offload="${TEACHER_PARAM_OFFLOAD}"
 )
 if [[ "${BF16_STUDENT_WEIGHTS}" == true && "${SHARE_STUDENT_WEIGHTS}" != true ]]; then
   cmd+=(actor_rollout_ref.actor.fsdp_config.model_dtype=bf16

@@ -337,6 +337,9 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
         self._is_actor = self.role in ["actor", "actor_rollout", "actor_rollout_ref"]
         self._is_rollout = self.role in ["rollout", "actor_rollout", "actor_rollout_ref"]
         self._is_ref = self.role in ["ref", "actor_rollout_ref"]
+        from verl.workers.config.rollout import validate_cpu_adam_config
+
+        validate_cpu_adam_config(self.config.rollout)
         self._share_rollout_weights = bool(self.config.rollout.get("share_weights", False))
         if self._share_rollout_weights:
             self._configure_shared_rollout_weights(world_size)
@@ -423,6 +426,24 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
         if self._is_ref and self.config.ref.log_prob_micro_batch_size is not None:
             self.config.ref.log_prob_micro_batch_size //= self.device_mesh.size() // self.ulysses_sequence_parallel_size
             self.config.ref.log_prob_micro_batch_size_per_gpu = self.config.ref.log_prob_micro_batch_size
+
+    def _uses_cpu_adam(self):
+        return bool(self.config.rollout.get("cpu_adam_enabled", False)
+                    or self.config.rollout.get("student_teacher_pipeline", False))
+
+    def _synchronous_cpu_adam(self):
+        return self._uses_cpu_adam() and self.config.rollout.get("cpu_adam_async") is False
+
+    def _assert_published_policy(self, data=None):
+        optimizer = self.actor_optimizer
+        if optimizer.pending is not None or optimizer.future is not None:
+            raise RuntimeError("synchronous OPD reached a consumer with an unpublished CPU update")
+        version = optimizer.version
+        if data is not None:
+            for key in ("rollout_policy_version", "scoring_policy_version"):
+                if key in data.meta_info and data.meta_info[key] != version:
+                    raise RuntimeError(f"synchronous OPD {key}={data.meta_info[key]}, current={version}")
+        return version
 
     def _configure_shared_rollout_weights(self, world_size: int) -> None:
         """Apply and validate the deliberately narrow zero-copy configuration."""
@@ -680,7 +701,15 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
             reduce_dtype = torch.float32
             buffer_dtype = torch.float32
 
-        mixed_precision = MixedPrecision(param_dtype=param_dtype, reduce_dtype=reduce_dtype, buffer_dtype=buffer_dtype)
+        fp32_gradients = role == "actor" and self.config.rollout.get("pipeline_fp32_gradients", False)
+        if fp32_gradients:
+            if self.config.actor.strategy != "fsdp" or not self._share_rollout_weights or not self._uses_cpu_adam():
+                raise ValueError("pipeline FP32 gradients require FSDP1, shared weights, and CPUAdamPipeline")
+            reduce_dtype = torch.float32
+        mixed_precision = MixedPrecision(
+            param_dtype=param_dtype, reduce_dtype=reduce_dtype, buffer_dtype=buffer_dtype,
+            keep_low_precision_grads=fp32_gradients,
+        )
 
         auto_wrap_policy = get_fsdp_wrap_policy(
             module=actor_module,
@@ -753,18 +782,23 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
             from verl.utils.torch_functional import get_constant_schedule_with_warmup, get_cosine_schedule_with_warmup
 
             actor_optimizer = build_optimizer(actor_module_fsdp.parameters(), optim_config)
-            if self.config.rollout.get("student_teacher_pipeline", False):
+            if self._uses_cpu_adam():
                 from verl.utils.cpu_adam_pipeline import CPUAdamPipeline
 
                 if not self._share_rollout_weights or self.config.actor.ppo_epochs != 1:
-                    raise ValueError("student teacher pipeline requires shared weights and ppo_epochs=1")
+                    raise ValueError("CPUAdamPipeline requires shared weights and ppo_epochs=1")
                 if fsdp_config.get("optimizer_offload_per_layer", False):
                     raise ValueError("CPU pipeline replaces optimizer_offload_per_layer; disable that option")
+                if not self.config.rollout.get("student_teacher_pipeline", False) and not self._synchronous_cpu_adam():
+                    raise ValueError("independent CPUAdam requires cpu_adam_async=false")
                 actor_optimizer = CPUAdamPipeline(
                     actor_optimizer, actor_module_fsdp,
                     overlap=self.config.rollout.pipeline_overlap,
                     threads=self.config.rollout.cpu_optimizer_threads,
                     gradient_offload=self.config.rollout.pipeline_gradient_offload,
+                    async_update=self.config.rollout.get("cpu_adam_async"),
+                    fp32_gradients=fp32_gradients,
+                    backend=self.config.rollout.get("pipeline_optimizer_backend", "cpu"),
                 )
             elif fsdp_config.get("optimizer_offload_per_layer", False):
                 from verl.utils.layerwise_optimizer import LayerwiseOffloadOptimizer
@@ -894,7 +928,7 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
             pipeline.wait_for_student()
         # The CPU pipeline has a pending D2H gradient copy. empty_cache and a
         # device-wide sync here would serialize that copy with the next rollout.
-        if not self.config.rollout.get("student_teacher_pipeline", False):
+        if not self._uses_cpu_adam():
             with _openmopd_nvtx("memory::empty_cache_before_rollout"):
                 aggressive_empty_cache(force_sync=True)
 
@@ -1091,10 +1125,16 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
                 log_gpu_memory_usage("After offload actor optimizer during init", logger=logger)
 
         if self._is_actor:
+            if self._synchronous_cpu_adam():
+                # Use the same OPD objective with and without student/teacher slots.
+                with open_dict(self.config.actor):
+                    self.config.actor.opd_refresh_advantage = True
             actor_cfg = omega_conf_to_dataclass(self.config.actor)
             self.actor = DataParallelPPOActor(
                 config=actor_cfg, actor_module=self.actor_module_fsdp, actor_optimizer=self.actor_optimizer
             )
+            if self._synchronous_cpu_adam():
+                self.actor._opd_reward_weight_mode = self.config.rollout.get("reward_weight_mode", "student_p")
 
         if self._is_rollout:
             self._build_rollout(trust_remote_code=self.config.model.get("trust_remote_code", False))
@@ -1216,7 +1256,8 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
                 self.config.actor.opd_refresh_advantage = True
             self.actor._opd_refresh_advantage = True
             self.actor._opd_reward_weight_mode = self.config.rollout.get("reward_weight_mode", "student_p")
-            self.rollout.pipeline_start_optimizer = self.actor_optimizer.start
+            if not self._synchronous_cpu_adam():
+                self.rollout.pipeline_start_optimizer = self.actor_optimizer.start
         pipeline = pipeline_type(
             models=[teacher.reward_module for teacher in teachers],
             names=[
@@ -1241,6 +1282,16 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
     @memory_phase("update")
     def update_actor(self, data: DataProto):
         assert self._is_actor
+        sync_version = None
+        if self._synchronous_cpu_adam():
+            pipeline = getattr(self, "_scoring_layer_pipeline", None)
+            if pipeline is not None:
+                # All teacher restores must finish before backward/publication can write.
+                pipeline.wait_for_student()
+            sync_version = self._assert_published_policy(data)
+            if "rollout_policy_version" not in data.meta_info or "scoring_policy_version" not in data.meta_info:
+                raise RuntimeError("synchronous OPD requires rollout and scoring version evidence")
+            data.meta_info.update(opd_pipeline=True, learner_policy_version=sync_version)
         if self._is_offload_param:
             with _openmopd_nvtx("io::h2d::actor_parameters_for_update"):
                 load_fsdp_model_to_gpu(self.actor_module_fsdp)
@@ -1255,12 +1306,24 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
             # perform training
             with Timer(name="update_policy", logger=None) as timer:
                 metrics = self.actor.update_policy(data=data)
-            if self.config.rollout.get("student_teacher_pipeline", False):
+            if self._uses_cpu_adam():
                 metrics.update(self.actor_optimizer.last_metrics)
                 metrics["pipeline/policy_lag"] = (
                     data.meta_info["learner_policy_version"] - data.meta_info["scoring_policy_version"]
                 )
                 metrics["pipeline/learner_version"] = self.actor_optimizer.version
+            if sync_version is not None:
+                published = self._assert_published_policy()
+                if published != sync_version + 1:
+                    raise RuntimeError("synchronous CPUAdam did not publish exactly one optimizer update")
+                metrics.update({
+                    "pipeline/rollout_version": data.meta_info["rollout_policy_version"],
+                    "pipeline/scoring_version": data.meta_info["scoring_policy_version"],
+                    "pipeline/learner_version": sync_version,
+                    "pipeline/published_version": published,
+                    "pipeline/policy_lag": sync_version - data.meta_info["rollout_policy_version"],
+                    "pipeline/update_pending": 0,
+                })
             delta_time = timer.last
             global_num_tokens = data.meta_info["global_token_num"]
             estimated_flops, promised_flops = self.flops_counter.estimate_flops(global_num_tokens, delta_time)
@@ -1314,6 +1377,7 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
         }
         prompts.meta_info.update(meta_info)
 
+        rollout_version = self._assert_published_policy() if self._synchronous_cpu_adam() else None
         timing_generate = {}
         if self._is_actor:  # For rollout only, we do not switch context.
             loop = get_event_loop()
@@ -1342,6 +1406,8 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
             }
         )
         output.meta_info["timing"] = timing_generate
+        if rollout_version is not None:
+            output.meta_info["rollout_policy_version"] = rollout_version
         with _openmopd_nvtx("io::d2h::rollout_outputs"):
             output = output.to("cpu")
 
@@ -1358,6 +1424,7 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
         return self._compute_log_prob(data)
 
     def _compute_log_prob(self, data: DataProto, teacher_forward_callback=None):
+        score_version = self._assert_published_policy(data) if self._synchronous_cpu_adam() else None
         # when is_lora is True, we use the actor without lora applied to calculate the log_prob
         # which is mostly used for ref log_prob calculation
         assert self._is_actor
@@ -1412,6 +1479,8 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
                 meta_info={"temperature": self.config.rollout.temperature},
             )
 
+        if score_version is not None:
+            output.meta_info["scoring_policy_version"] = score_version
         # Keep on GPU to avoid expensive CPU-GPU transfer for large top-k data
         # output = output.to("cpu")
 
@@ -1745,7 +1814,7 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
 
     @register(dispatch_mode=Dispatch.ONE_TO_ALL)
     def flush_pipeline(self):
-        if self._is_actor and self.config.rollout.get("student_teacher_pipeline", False):
+        if self._is_actor and self._uses_cpu_adam():
             pipeline = getattr(self, "_scoring_layer_pipeline", None)
             if pipeline is not None:
                 pipeline.wait_for_student()
@@ -2406,7 +2475,7 @@ class RewardModelWorker(Worker, DistProfilerExtension):
                 device_id=get_device_id(),
                 sharding_strategy=sharding_strategy,  # zero3
                 sync_module_states=True,
-                cpu_offload=CPUOffload(offload_params=True),
+                cpu_offload=CPUOffload(offload_params=bool(config.model.fsdp_config.get("param_offload", True))),
                 forward_prefetch=self.config.model.fsdp_config.forward_prefetch,
                 device_mesh=self.device_mesh,
             )
@@ -2418,7 +2487,9 @@ class RewardModelWorker(Worker, DistProfilerExtension):
             get_torch_device().empty_cache()
         elif config.strategy == "fsdp2":
             assert CPUOffloadPolicy is not None, "PyTorch version >= 2.4 is required for using fully_shard API (FSDP2)"
-            cpu_offload = CPUOffloadPolicy(pin_memory=True)
+            cpu_offload = (
+                CPUOffloadPolicy(pin_memory=True) if config.model.fsdp_config.get("param_offload", True) else None
+            )
             fsdp_kwargs = {
                 "mesh": fsdp_mesh,
                 "offload_policy": cpu_offload,
@@ -2570,6 +2641,9 @@ class RewardModelWorker(Worker, DistProfilerExtension):
         # This is used to import external_lib into the huggingface systems
         import_external_libs(self.config.model.get("external_lib", None))
         self.reward_module = self._build_model(config=self.config)
+        if not self.config.model.fsdp_config.get("param_offload", True):
+            self.reward_module.eval()
+            self.reward_module.requires_grad_(False)
         self._teacher_handle_prefetch = None
         self._teacher_forward_overlap = None
         self._teacher_layer_pipeline = None

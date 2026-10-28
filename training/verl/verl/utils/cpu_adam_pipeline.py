@@ -57,20 +57,76 @@ def _cpu_adam_worker(connection, groups, states, gradients, threads):
         connection.close()
 
 
+def _cuda_adam_worker(connection, groups, states, gradients, threads, device):
+    """Use the reference CUDA AdamW operations with CPU-resident FP32 state.
+
+    Only one parameter and its state are staged on GPU at a time. This changes
+    the arithmetic backend while retaining CPU masters, moments and publication.
+    """
+    start_memory_monitor()
+    try:
+        torch.set_num_threads(threads)
+        torch.cuda.set_device(device)
+        params = [p for group in groups for p in group["params"]]
+        group_indices = [i for i, group in enumerate(groups) for _ in group["params"]]
+        connection.send((True, None))
+        while True:
+            message = connection.recv()
+            if message is None:
+                break
+            live, options, steps = message
+            start = time.perf_counter()
+            for index in sorted(live):
+                master, state = params[index], states[index]
+                gpu_param = torch.nn.Parameter(master.detach().to(device), requires_grad=False)
+                optimizer = torch.optim.AdamW(
+                    [gpu_param], **options[group_indices[index]], foreach=False, fused=False,
+                )
+                optimizer.state[gpu_param] = {
+                    "step": torch.tensor(float(steps[index]), dtype=torch.float32),
+                    "exp_avg": state["exp_avg"].to(device),
+                    "exp_avg_sq": state["exp_avg_sq"].to(device),
+                }
+                gpu_param.grad = gradients[index].to(device)
+                optimizer.step()
+                with torch.no_grad():
+                    master.copy_(gpu_param)
+                    state["exp_avg"].copy_(optimizer.state[gpu_param]["exp_avg"])
+                    state["exp_avg_sq"].copy_(optimizer.state[gpu_param]["exp_avg_sq"])
+                del optimizer, gpu_param
+            connection.send((True, time.perf_counter() - start))
+    except BaseException:
+        connection.send((False, traceback.format_exc()))
+    finally:
+        connection.close()
+
+
 class CPUAdamPipeline(torch.optim.Optimizer):
     """GPU-facing optimizer with FP32 CPU masters and FP32 CPU moments.
 
     FSDP hooks offload completed layer gradients during backward. step() seals
     that gradient batch; start() submits CPU work just before rollout. With early
     offload disabled, start() also submits gradient DMA. Neither writes GPU
-    weights. The scoring pipeline publishes the result after old-policy scoring.
+    weights. By default the scoring pipeline publishes after old-policy scoring.
+    async_update=False instead flushes and publishes in step(); True defers
+    publication independently of copy/compute overlap. None retains legacy timing.
+    backend selects CPUAdam or CUDA AdamW arithmetic with the same CPU state.
     The public groups/state remain keyed by actor parameters for FSDP checkpoints.
     """
 
-    def __init__(self, optimizer, model, overlap=True, threads=8, gradient_offload=True):
+    def __init__(
+        self, optimizer, model, overlap=True, threads=8, gradient_offload=True,
+        async_update=None, fp32_gradients=False, backend="cpu",
+    ):
         from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
         from torch.distributed.fsdp._runtime_utils import _lazy_init
 
+        if backend not in ("cpu", "cuda"):
+            raise ValueError("pipeline_optimizer_backend must be 'cpu' or 'cuda'")
+        if async_update is not None and not isinstance(async_update, bool):
+            raise ValueError("cpu_adam_async must be true, false, or null")
+        self.backend = backend
+        self.fp32_gradients = fp32_gradients
         if optimizer.state:
             raise ValueError("CPUAdamPipeline must be constructed before any optimizer updates")
         if not isinstance(model, FSDP) or threads < 1:
@@ -83,6 +139,17 @@ class CPUAdamPipeline(torch.optim.Optimizer):
             n: m for n, m in model.named_modules() if isinstance(m, FSDP) and m._handle is not None
         }
         self.device = model.compute_device
+        if fp32_gradients:
+            for module in self.modules.values():
+                precision = module.mixed_precision
+                if not precision.keep_low_precision_grads or precision.reduce_dtype != torch.float32:
+                    raise ValueError("FP32 staging requires keep_low_precision_grads=True and reduce_dtype=float32")
+            # FSDP temporarily exposes BF16 views before replacing them with the
+            # FP32 reduced gradient. Permit both on originals, FP32 on flat params.
+            for parameter in model.parameters():
+                parameter.grad_dtype = None
+            for module in self.modules.values():
+                module._handle.flat_param.grad_dtype = torch.float32
         self.host_weights = {}
         self.gpu_weights = {}
         storage = {}
@@ -111,7 +178,10 @@ class CPUAdamPipeline(torch.optim.Optimizer):
                 offset = param.storage_offset() - flat.storage_offset()
                 output = host.narrow(0, offset, param.numel()).view(param.shape)
                 master = torch.nn.Parameter(output.float().share_memory_(), requires_grad=False)
-                gradient = empty_pinned_like(output)
+                gradient_template = (
+                    torch.empty_like(output, dtype=torch.float32, device="meta") if fp32_gradients else output
+                )
+                gradient = empty_pinned_like(gradient_template)
                 self.shared_gradients.append(torch.empty_like(master).share_memory_())
                 self.state[param] = {
                     "step": 0,
@@ -126,16 +196,18 @@ class CPUAdamPipeline(torch.optim.Optimizer):
         context = torch.multiprocessing.get_context("spawn")
         self.connection, child = context.Pipe()
         states = [{k: v for k, v in self.state[p].items() if k != "cpu_master"} for p, *_ in self.pairs]
+        worker = _cpu_adam_worker if backend == "cpu" else partial(_cuda_adam_worker, device=self.device)
         self.process = context.Process(
-            target=_cpu_adam_worker,
+            target=worker,
             args=(child, cpu_groups, states, self.shared_gradients, threads),
-            name="openmopd-cpu-adam",
+            name=f"openmopd-{backend}-adam",
             daemon=True,
         )
         self.process.start()
         child.close()
         self._receive()
         self.overlap = overlap
+        self.async_update = async_update
         self.executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="cpu-adam")
         self.copy_stream = torch.cuda.Stream(device=self.device)
         self.future = None
@@ -254,7 +326,10 @@ class CPUAdamPipeline(torch.optim.Optimizer):
         self.gradient_layers.clear()
         self.gradient_norms.clear()
         self.gradient_scale = None
-        if not self.overlap:
+        if self.async_update is False:
+            # A synchronous step includes native update, BF16 copy and publication.
+            self.flush()
+        elif self.async_update is None and not self.overlap:
             self.wait()
 
     def start(self):
