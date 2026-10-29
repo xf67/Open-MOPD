@@ -11,7 +11,10 @@ while (($# > 0)); do
         --help|-h)
             printf 'Usage: bash %s [--dry-run] [Hydra overrides...]\n' "$0"
             printf 'Activate conda environment mopd first. Defaults to one epoch without profiling.\n'
-            printf 'Use OPENMOPD_NUM_STEPS to limit steps; trailing Hydra overrides take precedence.\n'
+            printf 'Token batching: TOKEN_BATCHING_ENABLED=true, TOKEN_BATCHING_MIN_TOKENS=8192, TOKEN_BATCHING_MAX_BATCH_SIZE=64.\n'
+            printf 'Merge whole rollouts until prompt+response tokens strictly exceed the floor; the cap counts sequences after rollout.n.\n'
+            printf 'Token batching requires positive OPENMOPD_NUM_STEPS or trainer.total_training_steps; provide enough epochs/data.\n'
+            printf 'Trailing Hydra overrides take precedence; TOKEN_BATCHING_ENABLED=false restores ordinary batching.\n'
             printf 'USE_CU13=false; true prefers the CUDA 13 toolkit bundled with the selected Python environment.\n'
             printf 'Environment: PYTHONNOUSERSITE=1; VLLM_USE_V2_MODEL_RUNNER defaults to 0.\n'
             printf 'CPUAdam: CPU_ADAM_ENABLED=false, CPU_ADAM_ASYNC=null (true/false/null).\n'
@@ -98,13 +101,18 @@ export OPENMOPD_PINNED_ALIGNMENT_MB="${OPENMOPD_PINNED_ALIGNMENT_MB:-2}"
 [[ "${OPENMOPD_PINNED_ALIGNMENT_MB}" =~ ^[0-9]+$ ]] || die "OPENMOPD_PINNED_ALIGNMENT_MB must be a nonnegative integer"
 num_gpus="${OPENMOPD_N_GPUS_PER_NODE:-1}"
 train_batch_size="${OPENMOPD_TRAIN_BATCH_SIZE:-${num_gpus}}"
+# Keep rollout chunks fixed; merge actual prompt+response tokens before scoring/training.
+TOKEN_BATCHING_ENABLED="${TOKEN_BATCHING_ENABLED:-true}"
+TOKEN_BATCHING_MIN_TOKENS="${TOKEN_BATCHING_MIN_TOKENS:-8192}"
+TOKEN_BATCHING_MAX_BATCH_SIZE="${TOKEN_BATCHING_MAX_BATCH_SIZE:-64}"
 gpu_memory_limit_gb="${OPENMOPD_GPU_MEMORY_LIMIT_GB:-24}"
 kv_cache_mb="${OPENMOPD_KV_CACHE_MB:-4096}"
 max_num_seqs="${OPENMOPD_MAX_NUM_SEQS:-8}"
 val_batch_size="${OPENMOPD_VAL_BATCH_SIZE:-8}"
 val_reward_workers="${OPENMOPD_VAL_REWARD_WORKERS:-8}"
 val_before_train="${OPENMOPD_VAL_BEFORE_TRAIN:-true}"
-# Keep r2.sh's full-epoch default instead of the profiler's four-step capture.
+# Token batching requires an explicit optimizer-step budget (environment or trailing Hydra override).
+# null keeps the full-epoch behavior when token batching is disabled.
 num_steps="${OPENMOPD_NUM_STEPS:-null}"
 
 for var in USE_CU13 SHARE_STUDENT_WEIGHTS BF16_STUDENT_WEIGHTS OPTIMIZER_OFFLOAD_PER_LAYER \
@@ -112,7 +120,7 @@ for var in USE_CU13 SHARE_STUDENT_WEIGHTS BF16_STUDENT_WEIGHTS OPTIMIZER_OFFLOAD
   TEACHER_LAYER_PIPELINE PIPELINE_GRADIENT_OFFLOAD STEP_MEMORY_ENABLED val_before_train \
   CPU_ADAM_ENABLED PIPELINE_FP32_GRADIENTS TEACHER_PARAM_OFFLOAD \
   VERIFY_WEIGHT_SYNC SKIP_INITIAL_WEIGHT_SYNC ENFORCE_EAGER ENABLE_CHUNKED_PREFILL \
-  ENABLE_PREFIX_CACHING FREE_CACHE_ENGINE; do
+  ENABLE_PREFIX_CACHING FREE_CACHE_ENGINE TOKEN_BATCHING_ENABLED; do
   [[ "${!var}" == true || "${!var}" == false ]] || die "${var} must be true or false"
 done
 [[ "${CPU_ADAM_ASYNC}" == true || "${CPU_ADAM_ASYNC}" == false || "${CPU_ADAM_ASYNC}" == null ]] || \
@@ -129,7 +137,8 @@ case "${REWARD_WEIGHT_MODE}" in
 esac
 for var in num_gpus train_batch_size TEACHER_LAYER_PIPELINE_MAX_MB \
   TEACHER_PARAM_PREFETCH_MAX_MB CUDA_DEVICE_MAX_CONNECTIONS CPU_OPTIMIZER_THREADS \
-  gpu_memory_limit_gb kv_cache_mb max_num_seqs val_batch_size val_reward_workers; do
+  gpu_memory_limit_gb kv_cache_mb max_num_seqs val_batch_size val_reward_workers \
+  TOKEN_BATCHING_MIN_TOKENS TOKEN_BATCHING_MAX_BATCH_SIZE; do
   [[ "${!var}" =~ ^[1-9][0-9]*$ ]] || die "${var} must be a positive integer"
 done
 ((gpu_memory_limit_gb > 1 && kv_cache_mb < (gpu_memory_limit_gb - 1) * 1024)) || \
@@ -176,6 +185,9 @@ cmd=("${python_bin}" -m verl.trainer.main_ppo
   "data.train_files=$(hydra_string "${model_root}/data/rl_prompt_mix/train.parquet")"
   "data.val_files=$(hydra_string "${model_root}/data/rl_prompt_mix/eval.parquet")"
   data.train_batch_size="${train_batch_size}" data.max_prompt_length=1024 data.max_response_length=4096
+  data.token_batching.enabled="${TOKEN_BATCHING_ENABLED}"
+  data.token_batching.min_tokens="${TOKEN_BATCHING_MIN_TOKENS}"
+  data.token_batching.max_batch_size="${TOKEN_BATCHING_MAX_BATCH_SIZE}"
   data.val_batch_size="${val_batch_size}"
   data.filter_overlong_prompts=True data.truncation=error
   "actor_rollout_ref.model.path=$(hydra_string "${model_root}/MixSFT")"

@@ -1378,6 +1378,13 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
         prompts.meta_info.update(meta_info)
 
         rollout_version = self._assert_published_policy() if self._synchronous_cpu_adam() else None
+        if prompts.meta_info.get("pipeline_token_batch", False) and rollout_version is None:
+            if not self.config.rollout.get("student_teacher_pipeline", False):
+                raise ValueError("rollout token batching requires the student/teacher pipeline")
+            # CPU work may finish during multiple rollout calls, but the GPU
+            # weights are published only after the combined scoring cycle.
+            rollout_version = self.actor_optimizer.version
+
         timing_generate = {}
         if self._is_actor:  # For rollout only, we do not switch context.
             loop = get_event_loop()
@@ -1438,7 +1445,10 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
         is_lora = data.meta_info.pop("is_lora", False)
         adapter_ctx = self.actor.actor_module.disable_adapter() if is_lora else nullcontext()
         # we should always recompute old_log_probs when it is HybridEngine
-        data.meta_info["micro_batch_size"] = self.config.rollout.log_prob_micro_batch_size_per_gpu
+        data.meta_info["micro_batch_size"] = (
+            len(data) if data.meta_info.get("pipeline_token_batch", False)
+            else self.config.rollout.log_prob_micro_batch_size_per_gpu
+        )
         data.meta_info["max_token_len"] = self.config.rollout.log_prob_max_token_len_per_gpu
         data.meta_info["use_dynamic_bsz"] = self.config.rollout.log_prob_use_dynamic_bsz
         data.meta_info["temperature"] = self.config.rollout.temperature
@@ -1503,8 +1513,14 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
         """Overlap student/primary forwards, then score colocated MT teachers before returning."""
         if not self.config.rollout.get("teacher_forward_overlap", False):
             raise ValueError("joint scoring requires teacher_forward_overlap=true")
+        token_batch = data.meta_info.get("pipeline_token_batch", False)
+        if token_batch and not self.config.rollout.get("student_teacher_pipeline", False):
+            raise ValueError("token batching requires the student/teacher pipeline")
+        if token_batch and data.meta_info.get("rollout_policy_version") != self.actor_optimizer.version:
+            raise ValueError("Combined rollout batch no longer matches the scoring policy version")
+        scoring_batch_size = len(data) if token_batch else (self.config.rollout.log_prob_micro_batch_size_per_gpu or 0)
         if (
-            not 0 < len(data) <= (self.config.rollout.log_prob_micro_batch_size_per_gpu or 0)
+            not 0 < len(data) <= scoring_batch_size
             or self.config.rollout.log_prob_use_dynamic_bsz
         ):
             raise ValueError("teacher forward overlap requires exactly one fixed student micro-batch")
@@ -1513,7 +1529,7 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
         if data.meta_info.get("is_lora", False):
             raise ValueError("teacher forward overlap does not support reference/adapter-disabled scoring")
         teacher = self.get_fused_worker_by_name("rm")
-        if len(data) > (teacher.config.micro_batch_size_per_gpu or 0):
+        if not token_batch and len(data) > (teacher.config.micro_batch_size_per_gpu or 0):
             raise ValueError("teacher forward overlap requires exactly one fixed teacher micro-batch")
         runner = teacher.prepare_forward_overlap()
         # Deserialized TensorDicts may retain consolidated-storage metadata.
@@ -1608,7 +1624,10 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
 
         # Support all hardwares
         # we should always recompute old_log_probs when it is HybridEngine
-        data.meta_info["micro_batch_size"] = self.config.rollout.log_prob_micro_batch_size_per_gpu
+        data.meta_info["micro_batch_size"] = (
+            len(data) if data.meta_info.get("pipeline_token_batch", False)
+            else self.config.rollout.log_prob_micro_batch_size_per_gpu
+        )
         data.meta_info["max_token_len"] = self.config.rollout.log_prob_max_token_len_per_gpu
         data.meta_info["use_dynamic_bsz"] = self.config.rollout.log_prob_use_dynamic_bsz
         data.meta_info["temperature"] = self.config.rollout.temperature
@@ -1643,7 +1662,10 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
 
         # Support all hardwares
         # we should always recompute old_log_probs when it is HybridEngine
-        data.meta_info["micro_batch_size"] = self.config.rollout.log_prob_micro_batch_size_per_gpu
+        data.meta_info["micro_batch_size"] = (
+            len(data) if data.meta_info.get("pipeline_token_batch", False)
+            else self.config.rollout.log_prob_micro_batch_size_per_gpu
+        )
         data.meta_info["max_token_len"] = self.config.rollout.log_prob_max_token_len_per_gpu
         data.meta_info["use_dynamic_bsz"] = self.config.rollout.log_prob_use_dynamic_bsz
         data.meta_info["temperature"] = self.config.rollout.temperature
@@ -3355,14 +3377,18 @@ class RewardModelWorker(Worker, DistProfilerExtension):
 
         from verl.utils.seqlen_balancing import get_reverse_idx, rearrange_micro_batches
 
+        token_batch = data.meta_info.get("pipeline_token_batch", False)
+        if token_batch and getattr(self, "_teacher_layer_pipeline", None) is None:
+            raise ValueError("token batching requires a shared teacher pipeline")
+        micro_batch_size = len(data) if token_batch else (self.config.micro_batch_size_per_gpu or 0)
         if getattr(self, "_teacher_layer_pipeline", None) is not None and (
-            not 0 < len(data) <= (self.config.micro_batch_size_per_gpu or 0) or self.config.use_dynamic_bsz
+            not 0 < len(data) <= micro_batch_size or self.config.use_dynamic_bsz
         ):
             raise ValueError("teacher layer pipeline requires exactly one fixed micro-batch per scoring call")
         if precomputed_logits is not None:
             self.prepare_forward_overlap()
             if (
-                not 0 < len(data) <= (self.config.micro_batch_size_per_gpu or 0)
+                not 0 < len(data) <= micro_batch_size
                 or precomputed_logits.shape[:2] != data.batch["input_ids"].shape
             ):
                 raise ValueError("precomputed teacher logits do not match the single input micro-batch")
@@ -3423,7 +3449,7 @@ class RewardModelWorker(Worker, DistProfilerExtension):
                 max_token_len = self.config.forward_max_token_len_per_gpu * self.ulysses_sequence_parallel_size
                 micro_batches, indices = rearrange_micro_batches(batch=rm_data.batch, max_token_len=max_token_len)
             else:
-                micro_batches = rm_data.batch.split(self.config.micro_batch_size_per_gpu)
+                micro_batches = rm_data.batch.split(micro_batch_size)
             
             # Get Top-K and Top-P from config
             top_k = data.meta_info.get("log_prob_top_k", self.config.get("log_prob_top_k", 0))

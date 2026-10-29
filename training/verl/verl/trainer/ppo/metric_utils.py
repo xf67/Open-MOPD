@@ -131,6 +131,8 @@ def compute_data_metrics(batch: DataProto, use_critic: bool = True) -> dict[str,
     response_mask = batch.batch["response_mask"].bool()
 
     max_prompt_length = prompt_mask.size(-1)
+    prompt_clip_limit = batch.meta_info.get("token_batch_original_prompt_length", max_prompt_length)
+    response_clip_limit = batch.meta_info.get("token_batch_original_response_length", max_response_length)
 
     response_info = _compute_response_info(batch)
     prompt_length = response_info["prompt_length"]
@@ -271,7 +273,7 @@ def compute_data_metrics(batch: DataProto, use_critic: bool = True) -> dict[str,
         non_aborted_response_length_max = torch.max(non_aborted_response_length).detach().item()
         non_aborted_response_length_min = torch.min(non_aborted_response_length).detach().item()
         non_aborted_response_length_clip_ratio = (
-            torch.mean(torch.eq(non_aborted_response_length, max_response_length).float()).detach().item()
+            torch.mean(torch.eq(non_aborted_response_length, response_clip_limit).float()).detach().item()
         )
     else:
         raise ValueError("All samples are aborted, this should not happen.")
@@ -314,7 +316,7 @@ def compute_data_metrics(batch: DataProto, use_critic: bool = True) -> dict[str,
         "response_length/mean": torch.mean(response_length).detach().item(),
         "response_length/max": torch.max(response_length).detach().item(),
         "response_length/min": torch.min(response_length).detach().item(),
-        "response_length/clip_ratio": torch.mean(torch.eq(response_length, max_response_length).float())
+        "response_length/clip_ratio": torch.mean(torch.eq(response_length, response_clip_limit).float())
         .detach()
         .item(),
         # response length (non-aborted only)
@@ -330,7 +332,7 @@ def compute_data_metrics(batch: DataProto, use_critic: bool = True) -> dict[str,
         "prompt_length/mean": torch.mean(prompt_length).detach().item(),
         "prompt_length/max": torch.max(prompt_length).detach().item(),
         "prompt_length/min": torch.min(prompt_length).detach().item(),
-        "prompt_length/clip_ratio": torch.mean(torch.eq(prompt_length, max_prompt_length).float()).detach().item(),
+        "prompt_length/clip_ratio": torch.mean(torch.eq(prompt_length, prompt_clip_limit).float()).detach().item(),
     }
 
     # multi-turn conversation

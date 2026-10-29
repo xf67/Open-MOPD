@@ -72,6 +72,7 @@ from verl.utils.metric import reduce_metrics
 from verl.utils.rollout_skip import RolloutSkip
 from verl.utils.seqlen_balancing import calculate_workload, get_seqlen_balanced_partitions, log_seqlen_unbalance
 from verl.utils.step_memory import reduce_step_memory_metrics
+from verl.utils.token_batch import RolloutTokenAccumulator, validate_token_batching
 from verl.utils.torch_functional import masked_mean
 from verl.utils.tracking import ValidationGenerationsLogger
 from verl.workers.actor.mt_opd import (
@@ -845,6 +846,8 @@ class RayPPOTrainer:
 
             collate_fn = default_collate_fn
 
+        validate_token_batching(self.config)
+        self.token_batching = bool(self.config.data.get("token_batching", {}).get("enabled", False))
         num_workers = self.config.data["dataloader_num_workers"]
 
         if self.train_dataset is not None:
@@ -878,7 +881,7 @@ class RayPPOTrainer:
 
         train_size = len(self.train_dataloader) if self.train_dataloader is not None else 0
         print(
-            f"Size of train dataloader: {train_size}, Size of val dataloader: "
+            f"Size of train dataloader: {train_size} rollout batches, Size of val dataloader: "
             f"{len(self.val_dataloader)}"
         )
 
@@ -1711,6 +1714,45 @@ class RayPPOTrainer:
         )
         metrics.update(global_balance_stats)
 
+    def _collect_rollout_token_batch(self, first_batch, train_iterator, timing_raw):
+        """Keep vLLM chunk size fixed; send only a complete token batch to verl."""
+        cfg = self.config.data.token_batching
+        accumulator = RolloutTokenAccumulator(cfg.min_tokens, cfg.max_batch_size)
+        accumulator.add(first_batch)
+        while not accumulator.ready:
+            try:
+                batch_dict = next(train_iterator)
+            except StopIteration:
+                print(
+                    f"Dropping rollout token-batch tail: {accumulator.sequences} sequences, "
+                    f"{accumulator.tokens} valid tokens <= {cfg.min_tokens}", flush=True,
+                )
+                return None, {}
+            batch = DataProto.from_single_dict(batch_dict)
+            batch.non_tensor_batch["uid"] = np.array(
+                [str(uuid.uuid4()) for _ in range(len(batch))], dtype=object
+            )
+            prompts = self._get_gen_batch(batch)
+            prompts.meta_info.update(global_steps=self.global_steps, pipeline_token_batch=True)
+            repeats = self.config.actor_rollout_ref.rollout.n
+            prompts = prompts.repeat(repeat_times=repeats, interleave=True)
+            with marked_timer("gen", timing_raw, color="red"):
+                generated = self.actor_rollout_wg.generate_sequences(prompts)
+                for key, value in generated.meta_info.pop("timing", {}).items():
+                    if key.endswith("/topk_ratio"):
+                        timing_raw[key] = max(timing_raw.get(key, 0), value)
+                    else:
+                        timing_raw[key] = timing_raw.get(key, 0) + value
+            batch = batch.repeat(repeat_times=repeats, interleave=True).union(generated)
+            accumulator.add(batch)
+        batch, metrics = accumulator.finish()
+        print(
+            f"Token batch ready: {metrics['token_batch/rollout_batches']} rollout batches, "
+            f"{len(batch)} sequences, {accumulator.tokens} prompt+response tokens > {cfg.min_tokens}",
+            flush=True,
+        )
+        return batch, metrics
+
     def fit(self):
         """
         The training loop of PPO.
@@ -1901,7 +1943,9 @@ class RayPPOTrainer:
             return all(len(seen_by_domain[domain]) >= quotas[domain] for domain in seen_by_domain)
 
         for epoch in range(self.config.trainer.total_epochs):
-            for batch_dict in self.train_dataloader:
+            epoch_start_step = self.global_steps
+            train_iterator = iter(self.train_dataloader)
+            for batch_dict in train_iterator:
                 metrics = {}
                 timing_raw = {}
 
@@ -1923,6 +1967,8 @@ class RayPPOTrainer:
 
                 # pass global_steps to trace
                 gen_batch.meta_info["global_steps"] = self.global_steps
+                if self.token_batching:
+                    gen_batch.meta_info["pipeline_token_batch"] = True
                 gen_batch_output = gen_batch.repeat(
                     repeat_times=self.config.actor_rollout_ref.rollout.n, interleave=True
                 )
@@ -1979,6 +2025,18 @@ class RayPPOTrainer:
                     # repeat to align with repeated responses in rollout
                     batch = batch.repeat(repeat_times=self.config.actor_rollout_ref.rollout.n, interleave=True)
                     batch = batch.union(gen_batch_output)
+
+                    if self.token_batching:
+                        batch, token_metrics = self._collect_rollout_token_batch(batch, train_iterator, timing_raw)
+                        if batch is None:
+                            # Drop the incomplete epoch tail, and publish any outstanding CPU update.
+                            self.actor_rollout_wg.flush_pipeline()
+                            if step_memory_enabled:
+                                self.actor_rollout_wg.finish_step_memory(step=self.global_steps)
+                            self._stop_profiling(curr_step_profile, mark_step=curr_step_profile)
+                            prev_step_profile = False
+                            break
+                        metrics.update(token_metrics)
 
                     if "response_mask" not in batch.batch.keys():
                         batch.batch["response_mask"] = compute_response_mask(batch)
@@ -3688,3 +3746,8 @@ class RayPPOTrainer:
                 if hasattr(self.train_dataset, "on_batch_end"):
                     # The dataset may be changed after each training batch
                     self.train_dataset.on_batch_end(batch=batch)
+            if self.token_batching and self.global_steps == epoch_start_step:
+                raise ValueError("No rollout batch exceeded data.token_batching.min_tokens in this epoch")
+        if self.token_batching and self.global_steps <= self.total_training_steps:
+            self.actor_rollout_wg.flush_pipeline()
+            raise ValueError("Configured epochs exhausted before trainer.total_training_steps token batches completed")

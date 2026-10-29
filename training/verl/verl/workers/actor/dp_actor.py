@@ -1091,13 +1091,17 @@ class DataParallelPPOActor(BasePPOActor):
 
         # Split to make minibatch iterator for updating the actor
         # See PPO paper for details. https://arxiv.org/abs/1707.06347
-        mini_batches = data.split(self.config.ppo_mini_batch_size)
-
         pipeline = data.meta_info.get("opd_pipeline", False)
+        token_batch = data.meta_info.get("pipeline_token_batch", False)
+        if token_batch and (not pipeline or self.config.use_dynamic_bsz):
+            raise ValueError("token batching requires one intact pipeline training batch")
+        mini_batch_size = len(data) if token_batch else self.config.ppo_mini_batch_size
+        micro_batch_size = len(data) if token_batch else self.config.ppo_micro_batch_size_per_gpu
+        mini_batches = data.split(mini_batch_size)
         if pipeline and (len(mini_batches) != 1 or self.config.ppo_epochs != 1):
             raise ValueError("CPU OPD pipeline requires exactly one optimizer step per batch")
         if pipeline and self.actor_optimizer.gradient_offload and (
-            self.config.use_dynamic_bsz or self.config.ppo_micro_batch_size_per_gpu < len(data)
+            self.config.use_dynamic_bsz or micro_batch_size < len(data)
         ):
             raise ValueError("early gradient offload requires one fixed training micro-batch per step")
         on_policy = len(mini_batches) == 1 and self.config.ppo_epochs == 1 and not pipeline
@@ -1110,9 +1114,9 @@ class DataParallelPPOActor(BasePPOActor):
                     micro_batches, _ = prepare_dynamic_batch(mini_batch, max_token_len=max_token_len)
                 else:
                     self.gradient_accumulation = (
-                        self.config.ppo_mini_batch_size // self.config.ppo_micro_batch_size_per_gpu
+                        mini_batch_size // micro_batch_size
                     )
-                    micro_batches = mini_batch.split(self.config.ppo_micro_batch_size_per_gpu)
+                    micro_batches = mini_batch.split(micro_batch_size)
 
                 self.actor_optimizer.zero_grad()
 
@@ -1144,7 +1148,7 @@ class DataParallelPPOActor(BasePPOActor):
                     loss_agg_mode = self.config.loss_agg_mode
 
                     if self.config.use_dynamic_bsz:
-                        loss_scale_factor = response_mask.shape[0] / self.config.ppo_mini_batch_size
+                        loss_scale_factor = response_mask.shape[0] / mini_batch_size
                     else:
                         loss_scale_factor = 1 / self.gradient_accumulation
 
