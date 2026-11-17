@@ -74,13 +74,28 @@ class BF16StochasticAdamW(torch.optim.Optimizer):
         super().__init__(params, defaults)
 
     def load_state_dict(self, state_dict: dict) -> None:
-        super().load_state_dict(state_dict)
         # Optimizer.load_state_dict casts floating-point state to the parameter
-        # dtype. Undo that for the moments, which are deliberately FP32.
-        for param, state in self.state.items():
-            for name in ("exp_avg", "exp_avg_sq"):
-                if name in state:
-                    state[name] = state[name].to(device=param.device, dtype=torch.float32)
+        # dtype (BF16), which would round the deliberately FP32 moments. Keep
+        # the checkpoint's original tensors and restore them after loading.
+        moment_names = ("exp_avg", "exp_avg_sq")
+        saved_moments = {
+            index: {name: state[name] for name in moment_names if isinstance(state.get(name), torch.Tensor)}
+            for index, state in state_dict["state"].items()
+        }
+        super().load_state_dict(state_dict)
+        # Map checkpoint parameter ids to live parameters, as the base loader does.
+        saved_ids = [index for group in state_dict["param_groups"] for index in group["params"]]
+        params = [param for group in self.param_groups for param in group["params"]]
+        id_map = dict(zip(saved_ids, params, strict=True))
+        for index, moments in saved_moments.items():
+            param = id_map.get(index)
+            if param is None:
+                continue
+            state = self.state[param]
+            for name, value in moments.items():
+                # copy=True: later steps must not mutate the caller's checkpoint.
+                state[name] = value.to(device=param.device, dtype=torch.float32, copy=True)
+        for state in self.state.values():
             if isinstance(state.get("step"), torch.Tensor):
                 state["step"] = int(state["step"].item())
 
