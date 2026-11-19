@@ -1775,6 +1775,9 @@ class RayPPOTrainer:
 
         # load checkpoint before doing anything
         self._load_checkpoint()
+        # Optional speed-benchmark telemetry (verl.utils.speed_bench); off unless trainer.suite_token_budget is set.
+        self._speed_bench = self.config.trainer.get("suite_token_budget") is not None
+        self._suite_token_counts = {"tokens": 0, "response_tokens": 0, "sequences": 0}
 
         # A merged-HF warm start intentionally resets optimizer and dataloader
         # state, but may still continue the logical experiment step axis. This
@@ -2046,6 +2049,16 @@ class RayPPOTrainer:
                     # but might affect the loss calculation (due to the change of mini-batching).
                     if self.config.trainer.balance_batch:
                         self._balance_batch(batch, metrics=metrics)
+
+                    if self._speed_bench:
+                        # Telemetry and token-budget stopping only; no tensor/model changes.
+                        from verl.utils.speed_bench import batch_metrics
+
+                        suite_metrics, suite_last = batch_metrics(
+                            batch, self._suite_token_counts, self.config, self.global_steps
+                        )
+                        metrics.update(suite_metrics)
+                        is_last_step = is_last_step or suite_last
 
                     # compute global_valid tokens
                     batch.meta_info["global_token_num"] = torch.sum(batch.batch["attention_mask"], dim=-1).tolist()
@@ -3724,6 +3737,10 @@ class RayPPOTrainer:
 
                 # TODO: make a canonical logger that supports various backend
                 logger.log(data=metrics, step=self.global_steps)
+                if self._speed_bench:
+                    from verl.utils.speed_bench import record_step
+
+                    record_step(metrics, self.global_steps)
 
                 progress_bar.update(1)
                 self.global_steps += 1
