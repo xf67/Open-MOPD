@@ -29,6 +29,7 @@ from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
 from torch.distributed.tensor import DTensor
 
 import verl.utils.torch_functional as verl_F
+from verl.utils import chunked_head
 from verl import DataProto
 from verl.trainer.ppo.core_algos import agg_loss, get_policy_loss_fn, kl_penalty
 from verl.utils.attention_utils import index_first_axis, pad_input, rearrange, unpad_input
@@ -375,100 +376,146 @@ class DataParallelPPOActor(BasePPOActor):
                     extra_args["temperature"] = temperature
                     extra_args["return_dict"] = True
 
-                output = self._log_prob_model_forward(
-                    prefetch_callback,
-                    prefetch_point,
-                    input_ids=input_ids_rmpad,
-                    attention_mask=None,
-                    position_ids=position_ids_rmpad,
-                    **multi_modal_inputs,
-                    use_cache=False,
-                    **extra_args,
-                )  # prevent model thinks we are generating
-                
-                need_logits = top_k > 0
-
-                if self.use_fused_kernels and not need_logits:
-                    log_probs = output.log_probs.squeeze(0)  # (total_nnz,)
-                    entropy_rmpad = output.entropy.squeeze(0)  # (total_nnz,)
-
-                else:
-                    logits_rmpad = output.logits.squeeze(0)  # (total_nnz, vocab_size)
-                    logits_rmpad.div_(temperature)
-
-                    # if use_sp: ((total_nnz / sp) + pad) ; if not use_sp: (batch, seqlen)
-                    inplace_backward = True
-                    if calculate_entropy:
-                        inplace_backward = False
-                    
-                    # Optimization: when top_k > 0, compute log_softmax once and gather both
-                    # log_probs and topk_log_probs to avoid duplicate computation and gradient
-                    # issues from inplace operations
-                    need_topk = top_k > 0
-                    if need_topk:
-                        # Compute log_softmax once for both target and topk tokens
-                        # Note: we don't use inplace_backward here to ensure correct gradients
-                        # when both log_probs and topk_log_probs are needed
-                        log_probs_all = torch.log_softmax(logits_rmpad, dim=-1)
-                        # Gather log_probs for target tokens
-                        log_probs = log_probs_all.gather(
-                            dim=-1, index=input_ids_rmpad_rolled.unsqueeze(-1)
-                        ).squeeze(-1)
-                    else:
-                        log_probs = logprobs_from_logits(
-                            logits=logits_rmpad,
-                            labels=input_ids_rmpad_rolled,
-                            inplace_backward=inplace_backward,
+                _chunk = chunked_head.chunk_size()
+                if _chunk > 0 and not self.use_ulysses_sp and not self.use_fused_kernels:
+                    # Chunked LM head: never materialize [total_nnz, vocab] logits (see verl/utils/chunked_head.py).
+                    chunk_ids = None
+                    if top_k > 0 and student_top_k_ids is not None:
+                        chunk_ids = student_top_k_ids
+                        if student_top_k_ids.ndim == 3:
+                            if student_top_k_ids.size(-1) != top_k:
+                                raise ValueError(
+                                    f"student top-k width {student_top_k_ids.size(-1)} does not match K={top_k}"
+                                )
+                            if student_top_k_ids.shape[1] != seqlen:
+                                full_student_top_k_ids = torch.zeros(
+                                    (batch_size, seqlen, top_k),
+                                    dtype=student_top_k_ids.dtype,
+                                    device=student_top_k_ids.device,
+                                )
+                                full_student_top_k_ids[:, -response_length - 1 : -1, :] = student_top_k_ids
+                                student_top_k_ids = full_student_top_k_ids
+                            chunk_ids = student_top_k_ids.reshape(-1, top_k)[indices]
+                    with chunked_head.student_head(
+                        self.actor_module,
+                        labels=input_ids_rmpad_rolled,
+                        ids=chunk_ids,
+                        temperature=temperature,
+                        top_k=top_k,
+                        entropy_fn=self.compute_entropy_from_logits if calculate_entropy else None,
+                        chunk=_chunk,
+                    ):
+                        output = self._log_prob_model_forward(
+                            prefetch_callback,
+                            prefetch_point,
+                            input_ids=input_ids_rmpad,
+                            attention_mask=None,
+                            position_ids=position_ids_rmpad,
+                            **multi_modal_inputs,
+                            use_cache=False,
                         )
-
-                    # compute entropy
+                    head_out = output.logits
+                    log_probs = head_out["log_probs"]
                     if calculate_entropy:
-                        if not self.config.entropy_checkpointing:
-                            entropy_rmpad = self.compute_entropy_from_logits(logits_rmpad)  # ((total_nnz / sp) + pad)
-                        else:
-                            entropy_rmpad = torch.utils.checkpoint.checkpoint(
-                                self.compute_entropy_from_logits, logits_rmpad
-                            )
+                        entropy_rmpad = head_out["entropy"]
+                    if top_k > 0:
+                        topk_ids = head_out["topk_ids"]
+                        topk_log_probs = head_out["topk_log_probs"]
+                else:
+                    output = self._log_prob_model_forward(
+                        prefetch_callback,
+                        prefetch_point,
+                        input_ids=input_ids_rmpad,
+                        attention_mask=None,
+                        position_ids=position_ids_rmpad,
+                        **multi_modal_inputs,
+                        use_cache=False,
+                        **extra_args,
+                    )  # prevent model thinks we are generating
+                
+                    need_logits = top_k > 0
+
+                    if self.use_fused_kernels and not need_logits:
+                        log_probs = output.log_probs.squeeze(0)  # (total_nnz,)
+                        entropy_rmpad = output.entropy.squeeze(0)  # (total_nnz,)
+
+                    else:
+                        logits_rmpad = output.logits.squeeze(0)  # (total_nnz, vocab_size)
+                        logits_rmpad.div_(temperature)
+
+                        # if use_sp: ((total_nnz / sp) + pad) ; if not use_sp: (batch, seqlen)
+                        inplace_backward = True
+                        if calculate_entropy:
+                            inplace_backward = False
                     
-                    if need_topk:
-                        if student_top_k_ids is not None:
-                            # Use specific IDs from the rollout. They are padded
-                            # [batch, sequence/response, K] in the DataProto and
-                            # must follow the same remove-padding transform as
-                            # the actor input before indexing packed logits.
-                            topk_ids = student_top_k_ids
-                            if student_top_k_ids.ndim == 3:
-                                if student_top_k_ids.size(-1) != top_k:
-                                    raise ValueError(
-                                        f"student top-k width {student_top_k_ids.size(-1)} does not match K={top_k}"
-                                    )
-                                if student_top_k_ids.shape[1] != seqlen:
-                                    full_student_top_k_ids = torch.zeros(
-                                        (batch_size, seqlen, top_k),
-                                        dtype=student_top_k_ids.dtype,
-                                        device=student_top_k_ids.device,
-                                    )
-                                    full_student_top_k_ids[:, -response_length - 1 : -1, :] = student_top_k_ids
-                                    student_top_k_ids = full_student_top_k_ids
-
-                                flat_ids = student_top_k_ids.reshape(-1, top_k)
-                                topk_ids = flat_ids[indices]
-
-                            topk_ids = _align_rmpad_topk_ids_for_ulysses(
-                                topk_ids,
-                                local_token_count=log_probs_all.size(0),
-                                padding_size=pad_size if self.use_ulysses_sp else 0,
-                                sp_size=self.ulysses_sequence_parallel_size,
-                                sp_rank=get_ulysses_sequence_parallel_rank() if self.use_ulysses_sp else 0,
+                        # Optimization: when top_k > 0, compute log_softmax once and gather both
+                        # log_probs and topk_log_probs to avoid duplicate computation and gradient
+                        # issues from inplace operations
+                        need_topk = top_k > 0
+                        if need_topk:
+                            # Compute log_softmax once for both target and topk tokens
+                            # Note: we don't use inplace_backward here to ensure correct gradients
+                            # when both log_probs and topk_log_probs are needed
+                            log_probs_all = torch.log_softmax(logits_rmpad, dim=-1)
+                            # Gather log_probs for target tokens
+                            log_probs = log_probs_all.gather(
+                                dim=-1, index=input_ids_rmpad_rolled.unsqueeze(-1)
+                            ).squeeze(-1)
+                        else:
+                            log_probs = logprobs_from_logits(
+                                logits=logits_rmpad,
+                                labels=input_ids_rmpad_rolled,
+                                inplace_backward=inplace_backward,
                             )
 
-                        else:
-                            # Legacy/resample behavior already produces ids for
-                            # the local SP logits and needs no extra slicing.
-                            _, topk_ids = torch.topk(logits_rmpad, k=top_k, dim=-1)
+                        # compute entropy
+                        if calculate_entropy:
+                            if not self.config.entropy_checkpointing:
+                                entropy_rmpad = self.compute_entropy_from_logits(logits_rmpad)  # ((total_nnz / sp) + pad)
+                            else:
+                                entropy_rmpad = torch.utils.checkpoint.checkpoint(
+                                    self.compute_entropy_from_logits, logits_rmpad
+                                )
+                    
+                        if need_topk:
+                            if student_top_k_ids is not None:
+                                # Use specific IDs from the rollout. They are padded
+                                # [batch, sequence/response, K] in the DataProto and
+                                # must follow the same remove-padding transform as
+                                # the actor input before indexing packed logits.
+                                topk_ids = student_top_k_ids
+                                if student_top_k_ids.ndim == 3:
+                                    if student_top_k_ids.size(-1) != top_k:
+                                        raise ValueError(
+                                            f"student top-k width {student_top_k_ids.size(-1)} does not match K={top_k}"
+                                        )
+                                    if student_top_k_ids.shape[1] != seqlen:
+                                        full_student_top_k_ids = torch.zeros(
+                                            (batch_size, seqlen, top_k),
+                                            dtype=student_top_k_ids.dtype,
+                                            device=student_top_k_ids.device,
+                                        )
+                                        full_student_top_k_ids[:, -response_length - 1 : -1, :] = student_top_k_ids
+                                        student_top_k_ids = full_student_top_k_ids
 
-                        # Use pre-computed log_probs_all (always available when need_topk=True)
-                        topk_log_probs = log_probs_all.gather(dim=-1, index=topk_ids)
+                                    flat_ids = student_top_k_ids.reshape(-1, top_k)
+                                    topk_ids = flat_ids[indices]
+
+                                topk_ids = _align_rmpad_topk_ids_for_ulysses(
+                                    topk_ids,
+                                    local_token_count=log_probs_all.size(0),
+                                    padding_size=pad_size if self.use_ulysses_sp else 0,
+                                    sp_size=self.ulysses_sequence_parallel_size,
+                                    sp_rank=get_ulysses_sequence_parallel_rank() if self.use_ulysses_sp else 0,
+                                )
+
+                            else:
+                                # Legacy/resample behavior already produces ids for
+                                # the local SP logits and needs no extra slicing.
+                                _, topk_ids = torch.topk(logits_rmpad, k=top_k, dim=-1)
+
+                            # Use pre-computed log_probs_all (always available when need_topk=True)
+                            topk_log_probs = log_probs_all.gather(dim=-1, index=topk_ids)
 
                 # gather log_prob if sp > 1
                 if self.use_ulysses_sp:

@@ -130,8 +130,10 @@ for k, v in {**common, **switches}.items():
 for key in ['RUN_DIR', 'TOKEN_BUDGET', 'WARMUP_STEPS', 'MIN_MEASURED_STEPS', 'MAX_STEPS',
             'PYTHONHASHSEED', 'OPENMOPD_PINNED_ALIGNMENT_MB']:
     setarg('+ray_kwargs.ray_init.runtime_env.env_vars.' + key, "'" + os.environ[key] + "'")
-if os.environ.get('OPENMOPD_CHUNKED_HEAD'):  # chunked LM head (source_chunked only)
-    setarg('+ray_kwargs.ray_init.runtime_env.env_vars.OPENMOPD_CHUNKED_HEAD', "'" + os.environ['OPENMOPD_CHUNKED_HEAD'] + "'")
+# Memory switches (off unless set): chunked LM head, its backward mode, and torch-cache release before vLLM wakes.
+for key in ['OPENMOPD_CHUNKED_HEAD', 'OPENMOPD_CHUNKED_HEAD_BACKWARD', 'OPENMOPD_RELEASE_CACHE']:
+    if os.environ.get(key):
+        setarg('+ray_kwargs.ray_init.runtime_env.env_vars.' + key, "'" + os.environ[key] + "'")
 (out / 'argv.json').write_text(json.dumps(args, indent=2))
 is_config = '--cfg' in sys.argv
 if not is_config:

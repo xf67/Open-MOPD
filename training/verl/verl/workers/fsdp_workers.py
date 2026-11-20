@@ -27,6 +27,8 @@ from typing import Any, Optional
 import numpy as np
 import psutil
 import torch
+from contextlib import nullcontext
+from verl.utils import chunked_head
 import torch.distributed
 import torch.distributed as dist
 from codetiming import Timer
@@ -931,6 +933,15 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
         if not self._uses_cpu_adam():
             with _openmopd_nvtx("memory::empty_cache_before_rollout"):
                 aggressive_empty_cache(force_sync=True)
+        elif os.environ.get("OPENMOPD_RELEASE_CACHE", "0") == "1":
+            # Return the training phase's cached blocks before vLLM allocates its KV cache, so the two are never
+            # resident together. Wait only for the gradient D2H copy stream (not a device-wide sync); the CPU
+            # Adam thread keeps running on the host.
+            with _openmopd_nvtx("memory::release_cache_before_rollout"):
+                copy_stream = getattr(self.actor_optimizer, "copy_stream", None)
+                if copy_stream is not None:
+                    copy_stream.synchronize()
+                get_torch_device().empty_cache()
 
         if self._share_rollout_weights:
             set_expandable_segments(False)
@@ -2690,21 +2701,89 @@ class RewardModelWorker(Worker, DistProfilerExtension):
             self._teacher_forward_overlap = TeacherForwardOverlap(self.reward_module.compute_device, name)
         return self._teacher_forward_overlap
 
+    def _chunked_padded_teacher_outputs(
+        self, hidden, micro_batch, student_top_k_ids, compute_entropy, top_k, strategy, teacher_temperature,
+        top_p_intersec_p,
+    ):
+        """Padded-layout teacher outputs from hidden states, one [chunk, vocab] logits block at a time.
+
+        Same per-token math and output shapes as the full-logits padded branch of _forward_micro_batch.
+        """
+        import verl.utils.torch_functional as verl_F
+
+        response_length = micro_batch["responses"].size(-1)
+        resp_hidden = hidden[:, -response_length - 1 : -1, :]
+        bsz, resp_len, width = resp_hidden.shape
+        flat_hidden = resp_hidden.reshape(-1, width)
+        labels = micro_batch["responses"].reshape(-1)
+        flat_ids = None
+        if student_top_k_ids is not None:
+            k_s = student_top_k_ids.size(-1)
+            flat_ids = student_top_k_ids.reshape(-1, k_s)
+        chunk = chunked_head.chunk_size()
+        lp_parts, ent_parts, topk_parts, gather_parts = [], [], [], []
+        for start in range(0, flat_hidden.size(0), chunk):
+            end = min(start + chunk, flat_hidden.size(0))
+            logits = chunked_head.head_logits(
+                flat_hidden[start:end], hidden._head_weight, hidden._head_bias, teacher_temperature
+            )
+            if compute_entropy:
+                ent_parts.append(self._compute_entropy_safe(logits))
+            lp_parts.append(verl_F.logprobs_from_logits(logits, labels[start:end]))
+            if flat_ids is not None:
+                if top_k > 0:
+                    topk_parts.append(self._compute_teacher_top_k_log_probs(
+                        logits=logits, student_ids=flat_ids[start:end], top_k=top_k, strategy=strategy,
+                        top_p_intersec_p=top_p_intersec_p,
+                    ))
+                else:
+                    ids = flat_ids[start:end]
+                    gather_parts.append(
+                        torch.gather(logits, dim=-1, index=ids) - torch.logsumexp(logits, dim=-1, keepdim=True)
+                    )
+            del logits
+        rm_log_probs = torch.cat(lp_parts, dim=0).view(bsz, resp_len)
+        teacher_entropy = torch.cat(ent_parts, dim=0).view(bsz, resp_len) if compute_entropy else None
+        teacher_on_student_log_probs = teacher_top_k_ids = teacher_top_k_log_probs = None
+        teacher_valid_counts = teacher_overlap_mask = teacher_in_student_mask = None
+        if topk_parts:
+            on_student, counts, overlap, t_ids, t_logp, t_in_s = (
+                torch.cat([p[i] for p in topk_parts], dim=0) for i in range(6)
+            )
+            shape = student_top_k_ids.shape
+            teacher_on_student_log_probs = on_student.view(shape)
+            teacher_valid_counts = counts.view(shape[:-1])
+            teacher_overlap_mask = overlap.view(shape)
+            teacher_top_k_ids = t_ids.view(shape[0], shape[1], top_k)
+            teacher_top_k_log_probs = t_logp.view(shape[0], shape[1], top_k)
+            teacher_in_student_mask = t_in_s.view(shape[0], shape[1], top_k)
+        elif gather_parts:
+            teacher_on_student_log_probs = torch.cat(gather_parts, dim=0).view(student_top_k_ids.shape)
+        return (rm_log_probs, teacher_on_student_log_probs, teacher_top_k_ids, teacher_top_k_log_probs,
+                teacher_entropy, teacher_valid_counts, teacher_overlap_mask, teacher_in_student_mask)
+
     def _forward_model_logits(self, micro_batch):
         """Padded-layout model call only; no dependency on student top-k IDs."""
         position_ids = micro_batch["position_ids"]
         if position_ids.dim() == 3:
             position_ids = position_ids.transpose(0, 1)
+        chunked = chunked_head.chunk_size() > 0 and not self.use_fused_kernels
+        head_ctx = chunked_head.hidden_head(self.reward_module) if chunked else nullcontext()
         with torch.no_grad(), torch.autocast(device_type=get_device_name(), dtype=torch.bfloat16):
-            output = self.reward_module(
-                input_ids=micro_batch["input_ids"],
-                attention_mask=micro_batch["attention_mask"],
-                position_ids=position_ids,
-                use_cache=False,
-                return_dict=self.use_fused_kernels,
-            )
+            with head_ctx as stash:
+                output = self.reward_module(
+                    input_ids=micro_batch["input_ids"],
+                    attention_mask=micro_batch["attention_mask"],
+                    position_ids=position_ids,
+                    use_cache=False,
+                    return_dict=self.use_fused_kernels,
+                )
             release_fsdp_cpu_offloaded_param_views(self.reward_module)
-        return output[0] if isinstance(output, tuple) else output.logits
+        result = output[0] if isinstance(output, tuple) else output.logits
+        if chunked:
+            # [B, S, hidden] instead of [B, S, vocab]; reduced chunk by chunk in _forward_micro_batch.
+            result = chunked_head.attach(result, stash)
+        return result
 
     def start_param_prefetch(self, max_mb: int):
         """Prime the shared layer pool, or enqueue the legacy single-shard copy."""
@@ -2802,86 +2881,144 @@ class RewardModelWorker(Worker, DistProfilerExtension):
                     )
 
                 input_ids_rmpad_rolled = input_ids_rmpad_rolled.squeeze(0)
-                output = self.reward_module(
-                    input_ids=input_ids_rmpad,
-                    attention_mask=None,
-                    position_ids=position_ids_rmpad,
-                    use_cache=False,
-                    return_dict=self.use_fused_kernels,
-                )
-                release_fsdp_cpu_offloaded_param_views(self.reward_module)
-
-                local_entropy_rmpad = None
-                local_valid_counts = None
-                local_overlap_mask = None
-                local_top_k_log_probs_on_student_ids = None
-                local_teacher_top_k_ids = None
-                local_teacher_top_k_log_probs = None
-                local_teacher_in_student_mask = None
-
-                if self.use_fused_kernels and not need_logits:
-                    rm_log_probs = output.log_probs.squeeze(0)  # (total_nnz,)
-                    rm_log_probs = rm_log_probs.to(torch.float32)
-                else:
-                    logits_rmpad = output[0] if isinstance(output, tuple) else output.logits
-                    logits_rmpad = logits_rmpad.squeeze(0)  # (total_nnz, vocab_size)
-                    logits_rmpad = logits_rmpad.div_(teacher_temperature)
-
-                    # Compute entropy if logits are available
-                    # We compute entropy on the logits.
-                    # Note: logits_rmpad is for the next token prediction.
-                    # We want entropy at each position.
-                    if compute_entropy:
-                        local_entropy_rmpad = self._compute_entropy_safe(logits_rmpad) # (total_nnz,)
-
-                    # if use_sp: ((total_nnz / sp) + pad) ; if not use_sp: (batch, seqlen)
-                    inplace_backward = True
-
-                    rm_log_probs = verl_F.logprobs_from_logits(
-                        logits=logits_rmpad,
-                        labels=input_ids_rmpad_rolled,
-                        inplace_backward=inplace_backward,
-                    )
-                    
-                    if student_top_k_ids is not None:
-                         k_s = student_top_k_ids.shape[-1]
-                         # construct the full top_k_ids to align with the packed logits
-                         # logits predict the next token, so we need to align the id at t+1 to logits at t
-                         # response is at the end of the sequence
-                         full_student_top_k_ids = torch.zeros((batch_size, seqlen, k_s), dtype=torch.long, device=logits_rmpad.device)
-                         full_student_top_k_ids[:, -response_length-1:-1, :] = student_top_k_ids
-                         
-                         # pack it
-                         packed_top_k_ids = index_first_axis(rearrange(full_student_top_k_ids, "b s k -> (b s) k"), indices)
-                         
-                         # slice it if sp
-                         if self.use_ulysses_sp:
-                             local_top_k_ids, _, _ = ulysses_pad_and_slice_inputs(
-                                 packed_top_k_ids,
-                                 position_ids_rmpad=None,
-                                 sp_size=self.ulysses_sequence_parallel_size,
-                             )
-                         else:
-                             local_top_k_ids = packed_top_k_ids
-
-                         # compute local top_k log probs
-                         # (total_nnz, k) or (total_nnz/sp, k)
-                         
-                         # Apply filtering if top_k > 0
-                         if top_k > 0:
-                             # Use chunked broadcasting to save memory
-                             # logits_rmpad: (total_nnz, Vocab)
-                             # local_top_k_ids: (total_nnz, K_s)
-                            local_top_k_log_probs_on_student_ids, local_valid_counts, local_overlap_mask, local_teacher_top_k_ids, local_teacher_top_k_log_probs, local_teacher_in_student_mask = self._compute_teacher_top_k_log_probs(
-                                logits=logits_rmpad,
-                                student_ids=local_top_k_ids,
+                _chunk = chunked_head.chunk_size()
+                if _chunk > 0 and not self.use_ulysses_sp and not self.use_fused_kernels:
+                    # Chunked LM head (verl/utils/chunked_head.py): reduce [chunk, vocab] logits one chunk at a time.
+                    with chunked_head.hidden_head(self.reward_module) as _stash:
+                        output = self.reward_module(
+                            input_ids=input_ids_rmpad,
+                            attention_mask=None,
+                            position_ids=position_ids_rmpad,
+                            use_cache=False,
+                            return_dict=self.use_fused_kernels,
+                        )
+                    release_fsdp_cpu_offloaded_param_views(self.reward_module)
+                    hidden_rmpad = (output[0] if isinstance(output, tuple) else output.logits).squeeze(0)
+                    local_entropy_rmpad = None
+                    local_valid_counts = None
+                    local_overlap_mask = None
+                    local_top_k_log_probs_on_student_ids = None
+                    local_teacher_top_k_ids = None
+                    local_teacher_top_k_log_probs = None
+                    local_teacher_in_student_mask = None
+                    local_top_k_ids = None
+                    if student_top_k_ids is not None and top_k > 0:
+                        k_s = student_top_k_ids.shape[-1]
+                        full_student_top_k_ids = torch.zeros(
+                            (batch_size, seqlen, k_s), dtype=torch.long, device=hidden_rmpad.device
+                        )
+                        full_student_top_k_ids[:, -response_length - 1 : -1, :] = student_top_k_ids
+                        local_top_k_ids = index_first_axis(rearrange(full_student_top_k_ids, "b s k -> (b s) k"), indices)
+                    lp_parts, ent_parts, topk_parts = [], [], []
+                    for _s in range(0, hidden_rmpad.size(0), _chunk):
+                        _e = min(_s + _chunk, hidden_rmpad.size(0))
+                        logits_chunk = chunked_head.head_logits(
+                            hidden_rmpad[_s:_e], _stash["weight"], _stash["bias"], teacher_temperature
+                        )
+                        if compute_entropy:
+                            ent_parts.append(self._compute_entropy_safe(logits_chunk))
+                        lp_parts.append(verl_F.logprobs_from_logits(
+                            logits=logits_chunk, labels=input_ids_rmpad_rolled[_s:_e], inplace_backward=True
+                        ))
+                        if local_top_k_ids is not None:
+                            topk_parts.append(self._compute_teacher_top_k_log_probs(
+                                logits=logits_chunk,
+                                student_ids=local_top_k_ids[_s:_e],
                                 top_k=top_k,
                                 strategy=strategy,
                                 top_p_intersec_p=top_p_intersec_p,
-                            )
+                            ))
+                        del logits_chunk
+                    del _stash
+                    rm_log_probs = torch.cat(lp_parts, dim=0)
+                    if compute_entropy:
+                        local_entropy_rmpad = torch.cat(ent_parts, dim=0)
+                    if topk_parts:
+                        (local_top_k_log_probs_on_student_ids, local_valid_counts, local_overlap_mask,
+                         local_teacher_top_k_ids, local_teacher_top_k_log_probs, local_teacher_in_student_mask) = (
+                            torch.cat([p[i] for p in topk_parts], dim=0) for i in range(6)
+                        )
+                else:
+                    output = self.reward_module(
+                        input_ids=input_ids_rmpad,
+                        attention_mask=None,
+                        position_ids=position_ids_rmpad,
+                        use_cache=False,
+                        return_dict=self.use_fused_kernels,
+                    )
+                    release_fsdp_cpu_offloaded_param_views(self.reward_module)
 
+                    local_entropy_rmpad = None
+                    local_valid_counts = None
+                    local_overlap_mask = None
+                    local_top_k_log_probs_on_student_ids = None
+                    local_teacher_top_k_ids = None
+                    local_teacher_top_k_log_probs = None
+                    local_teacher_in_student_mask = None
+
+                    if self.use_fused_kernels and not need_logits:
+                        rm_log_probs = output.log_probs.squeeze(0)  # (total_nnz,)
+                        rm_log_probs = rm_log_probs.to(torch.float32)
                     else:
-                         pass
+                        logits_rmpad = output[0] if isinstance(output, tuple) else output.logits
+                        logits_rmpad = logits_rmpad.squeeze(0)  # (total_nnz, vocab_size)
+                        logits_rmpad = logits_rmpad.div_(teacher_temperature)
+
+                        # Compute entropy if logits are available
+                        # We compute entropy on the logits.
+                        # Note: logits_rmpad is for the next token prediction.
+                        # We want entropy at each position.
+                        if compute_entropy:
+                            local_entropy_rmpad = self._compute_entropy_safe(logits_rmpad) # (total_nnz,)
+
+                        # if use_sp: ((total_nnz / sp) + pad) ; if not use_sp: (batch, seqlen)
+                        inplace_backward = True
+
+                        rm_log_probs = verl_F.logprobs_from_logits(
+                            logits=logits_rmpad,
+                            labels=input_ids_rmpad_rolled,
+                            inplace_backward=inplace_backward,
+                        )
+                    
+                        if student_top_k_ids is not None:
+                             k_s = student_top_k_ids.shape[-1]
+                             # construct the full top_k_ids to align with the packed logits
+                             # logits predict the next token, so we need to align the id at t+1 to logits at t
+                             # response is at the end of the sequence
+                             full_student_top_k_ids = torch.zeros((batch_size, seqlen, k_s), dtype=torch.long, device=logits_rmpad.device)
+                             full_student_top_k_ids[:, -response_length-1:-1, :] = student_top_k_ids
+                         
+                             # pack it
+                             packed_top_k_ids = index_first_axis(rearrange(full_student_top_k_ids, "b s k -> (b s) k"), indices)
+                         
+                             # slice it if sp
+                             if self.use_ulysses_sp:
+                                 local_top_k_ids, _, _ = ulysses_pad_and_slice_inputs(
+                                     packed_top_k_ids,
+                                     position_ids_rmpad=None,
+                                     sp_size=self.ulysses_sequence_parallel_size,
+                                 )
+                             else:
+                                 local_top_k_ids = packed_top_k_ids
+
+                             # compute local top_k log probs
+                             # (total_nnz, k) or (total_nnz/sp, k)
+                         
+                             # Apply filtering if top_k > 0
+                             if top_k > 0:
+                                 # Use chunked broadcasting to save memory
+                                 # logits_rmpad: (total_nnz, Vocab)
+                                 # local_top_k_ids: (total_nnz, K_s)
+                                local_top_k_log_probs_on_student_ids, local_valid_counts, local_overlap_mask, local_teacher_top_k_ids, local_teacher_top_k_log_probs, local_teacher_in_student_mask = self._compute_teacher_top_k_log_probs(
+                                    logits=logits_rmpad,
+                                    student_ids=local_top_k_ids,
+                                    top_k=top_k,
+                                    strategy=strategy,
+                                    top_p_intersec_p=top_p_intersec_p,
+                                )
+
+                        else:
+                             pass
 
                 # pad it back
                 if self.use_ulysses_sp:
@@ -3060,6 +3197,11 @@ class RewardModelWorker(Worker, DistProfilerExtension):
                     rm_output_logits = precomputed_logits
                     if rm_output_logits is None:
                         rm_output_logits = self._forward_model_logits(micro_batch)
+                    if chunked_head.is_hidden(rm_output_logits):
+                        return self._chunked_padded_teacher_outputs(
+                            rm_output_logits, micro_batch, student_top_k_ids, compute_entropy, top_k, strategy,
+                            teacher_temperature, top_p_intersec_p,
+                        )
                     rm_logits_resp = rm_output_logits[:, -response_length - 1 : -1, :]  # (bsz, response_length, vocab_size)
                     rm_logits_resp = rm_logits_resp.div_(teacher_temperature)
                     
