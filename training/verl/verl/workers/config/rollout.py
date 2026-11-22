@@ -213,6 +213,12 @@ class RolloutConfig(BaseConfig):
     # Arithmetic backend only; masters and moments remain FP32 CPU tensors.
     pipeline_optimizer_backend: str = "cpu"
     pipeline_overlap: bool = True
+    # Single-node CPU data parallel: rank-local FSDP, one shared host copy of the
+    # student optimizer/teachers, CPU gradient reduction and one CPUAdam (owner rank).
+    cpu_dp: bool = False
+    cpu_dp_owner_rank: int = 0
+    # Threads per NUMA-node optimizer worker (default: cpu_optimizer_threads).
+    cpu_dp_node_threads: Optional[int] = None
     cpu_optimizer_threads: int = 8
     pipeline_gradient_offload: bool = True
 

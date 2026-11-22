@@ -710,7 +710,7 @@ class vLLMRollout(BaseRollout):
             }
         elif is_validate:
             # Get max_tokens from val_kwargs, use response_length as fallback if None
-            val_max_tokens = self.config.val_kwargs.get("max_tokens", self.config.response_length)
+            val_max_tokens = self.config.val_kwargs.get("max_tokens") or self.config.response_length
             kwargs = {
                 "top_k": self.config.val_kwargs.top_k,
                 "top_p": self.config.val_kwargs.top_p,
@@ -729,7 +729,9 @@ class vLLMRollout(BaseRollout):
         # Determine the max_length for padding: use val_kwargs.max_tokens if in validation mode and set,
         # otherwise use response_length
         if is_validate:
-            val_max_tokens = self.config.val_kwargs.get("max_tokens", self.config.response_length)
+            # An explicit null means "response_length". Padding must not depend on this rank's
+            # longest response, or data-parallel ranks return different widths.
+            val_max_tokens = self.config.val_kwargs.get("max_tokens") or self.config.response_length
             padding_max_length = val_max_tokens
         else:
             padding_max_length = self.config.response_length

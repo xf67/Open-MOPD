@@ -56,6 +56,27 @@ def run_ppo(config, task_runner_class=None) -> None:
                 model paths, and training hyperparameters.
         task_runner_class: For recipe to change TaskRunner.
     """
+    # CPU data parallel: one shared-memory namespace per run, exported to every worker
+    # and unlinked when training returns (live mappings stay valid until released).
+    shm_namespace = None
+    if config.actor_rollout_ref.rollout.get("cpu_dp", False):
+        from verl.utils import cpu_dp, shared_host
+
+        if config.trainer.nnodes != 1 or config.trainer.n_gpus_per_node < 2:
+            raise ValueError("rollout.cpu_dp requires one node with at least two GPUs")
+        shm_namespace = shared_host.new_namespace()
+        os.environ[cpu_dp.ENV] = "1"
+        print(f"CPU data parallel: shared host namespace /dev/shm/{shm_namespace}")
+    try:
+        _run_ppo(config, task_runner_class, shm_namespace)
+    finally:
+        if shm_namespace is not None:
+            from verl.utils import shared_host
+
+            shared_host.remove_namespace(shm_namespace)
+
+
+def _run_ppo(config, task_runner_class, shm_namespace):
     # Check if Ray is not initialized
     if not ray.is_initialized():
         # Initialize Ray with a local cluster configuration
@@ -72,6 +93,18 @@ def run_ppo(config, task_runner_class=None) -> None:
             runtime_env_vars["TRANSFER_QUEUE_ENABLE"] = "1"
             runtime_env_kwargs["env_vars"] = runtime_env_vars
 
+        if shm_namespace is not None:
+            from verl.utils import cpu_dp, shared_host
+
+            # Hydra configs are struct-locked; rebuild a plain container with the extra variables.
+            plain = runtime_env_kwargs
+            if OmegaConf.is_config(plain):
+                plain = OmegaConf.to_container(plain, resolve=True)
+            plain = dict(plain)
+            plain["env_vars"] = {
+                **dict(plain.get("env_vars") or {}), shared_host.NAMESPACE_ENV: shm_namespace, cpu_dp.ENV: "1",
+            }
+            runtime_env_kwargs = OmegaConf.create(plain)
         runtime_env = OmegaConf.merge(default_runtime_env, runtime_env_kwargs)
         ray_init_kwargs = OmegaConf.create({**ray_init_kwargs, "runtime_env": runtime_env})
         print(f"ray init kwargs: {ray_init_kwargs}")

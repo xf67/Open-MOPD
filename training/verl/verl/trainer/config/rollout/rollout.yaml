@@ -46,6 +46,15 @@ pipeline_optimizer_backend: cpu
 # while waiting for optimizer work in step(); it does not publish the update.
 pipeline_overlap: true
 
+# Single-node CPU data parallel (n_gpus_per_node > 1): every GPU holds a rank-local
+# student replica and runs its own vLLM engine and teacher slots; gradients are summed
+# on CPU and one CPUAdam (on cpu_dp_owner_rank) updates a single shared host copy.
+# Requires the CPUAdam pipeline and CPU-offloaded FSDP1 teachers.
+cpu_dp: false
+cpu_dp_owner_rank: 0
+# Threads per NUMA-node optimizer worker; null uses cpu_optimizer_threads.
+cpu_dp_node_threads: null
+
 # CPU threads for the optimizer and BF16/FP32 staging.
 cpu_optimizer_threads: 8
 

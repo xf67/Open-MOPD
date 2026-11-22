@@ -26,6 +26,9 @@ while (($# > 0)); do
             printf 'Rollout: ENFORCE_EAGER=false, ENABLE_CHUNKED_PREFILL=true, ENABLE_PREFIX_CACHING=true, FREE_CACHE_ENGINE=true.\n'
             printf 'Set STEP_MEMORY_ENABLED=false to disable step/phase memory telemetry for speed tests.\n'
             printf 'Pinned pipeline buffers round to 2 MiB; OPENMOPD_PINNED_ALIGNMENT_MB=0 restores PyTorch allocation.\n'
+            printf 'CPU data parallel: OPENMOPD_N_GPUS_PER_NODE=4 enables CPU_DP=true (one shared host copy, CPU gradient\n'
+            printf '  reduction, one CPUAdam); OPENMOPD_TRAIN_BATCH_SIZE defaults to the GPU count (1 sequence per GPU).\n'
+            printf '  CPU_DP_OWNER_RANK=0, CPU_DP_NODE_THREADS=<cpu_optimizer_threads>; the GPU budget is per GPU.\n'
             exit 0 ;;
         --) shift; break ;;
         -*) die "Unknown option: $1" ;;
@@ -101,8 +104,16 @@ export OPENMOPD_PINNED_ALIGNMENT_MB="${OPENMOPD_PINNED_ALIGNMENT_MB:-2}"
 [[ "${OPENMOPD_PINNED_ALIGNMENT_MB}" =~ ^[0-9]+$ ]] || die "OPENMOPD_PINNED_ALIGNMENT_MB must be a nonnegative integer"
 num_gpus="${OPENMOPD_N_GPUS_PER_NODE:-1}"
 train_batch_size="${OPENMOPD_TRAIN_BATCH_SIZE:-${num_gpus}}"
+cpu_dp_default=false
+if [[ "${num_gpus}" =~ ^[0-9]+$ ]] && ((num_gpus > 1)); then cpu_dp_default=true; fi
+CPU_DP="${CPU_DP:-${cpu_dp_default}}"
+CPU_DP_OWNER_RANK="${CPU_DP_OWNER_RANK:-0}"
+CPU_DP_NODE_THREADS="${CPU_DP_NODE_THREADS:-null}"
 # Keep rollout chunks fixed; merge actual prompt+response tokens before scoring/training.
-TOKEN_BATCHING_ENABLED="${TOKEN_BATCHING_ENABLED:-true}"
+# Token batching is single-GPU only.
+token_batching_default=false
+if [[ "${CPU_DP}" == true ]]; then token_batching_default=false; fi
+TOKEN_BATCHING_ENABLED="${TOKEN_BATCHING_ENABLED:-${token_batching_default}}"
 TOKEN_BATCHING_MIN_TOKENS="${TOKEN_BATCHING_MIN_TOKENS:-8192}"
 TOKEN_BATCHING_MAX_BATCH_SIZE="${TOKEN_BATCHING_MAX_BATCH_SIZE:-64}"
 gpu_memory_limit_gb="${OPENMOPD_GPU_MEMORY_LIMIT_GB:-24}"
@@ -120,7 +131,7 @@ for var in USE_CU13 SHARE_STUDENT_WEIGHTS BF16_STUDENT_WEIGHTS OPTIMIZER_OFFLOAD
   TEACHER_LAYER_PIPELINE PIPELINE_GRADIENT_OFFLOAD STEP_MEMORY_ENABLED val_before_train \
   CPU_ADAM_ENABLED PIPELINE_FP32_GRADIENTS TEACHER_PARAM_OFFLOAD \
   VERIFY_WEIGHT_SYNC SKIP_INITIAL_WEIGHT_SYNC ENFORCE_EAGER ENABLE_CHUNKED_PREFILL \
-  ENABLE_PREFIX_CACHING FREE_CACHE_ENGINE TOKEN_BATCHING_ENABLED; do
+  ENABLE_PREFIX_CACHING FREE_CACHE_ENGINE TOKEN_BATCHING_ENABLED CPU_DP; do
   [[ "${!var}" == true || "${!var}" == false ]] || die "${var} must be true or false"
 done
 [[ "${CPU_ADAM_ASYNC}" == true || "${CPU_ADAM_ASYNC}" == false || "${CPU_ADAM_ASYNC}" == null ]] || \
@@ -143,15 +154,25 @@ for var in num_gpus train_batch_size TEACHER_LAYER_PIPELINE_MAX_MB \
 done
 ((gpu_memory_limit_gb > 1 && kv_cache_mb < (gpu_memory_limit_gb - 1) * 1024)) || \
   die "GPU budget must exceed 1 GiB plus the KV cache"
-((num_gpus == 1)) || die "The GPU memory budget currently requires one GPU"
+if ((num_gpus > 1)); then
+  [[ "${CPU_DP}" == true ]] || die "More than one GPU requires CPU_DP=true (the GPU budget is per GPU)"
+  [[ "${TOKEN_BATCHING_ENABLED}" == false ]] || die "Token batching is single-GPU only; set TOKEN_BATCHING_ENABLED=false"
+  [[ "${CPU_DP_OWNER_RANK}" =~ ^[0-9]+$ ]] && ((CPU_DP_OWNER_RANK < num_gpus)) || \
+    die "CPU_DP_OWNER_RANK must be in [0, num_gpus)"
+  [[ "${CPU_DP_NODE_THREADS}" == null || "${CPU_DP_NODE_THREADS}" =~ ^[1-9][0-9]*$ ]] || \
+    die "CPU_DP_NODE_THREADS must be null or a positive integer"
+else
+  [[ "${CPU_DP}" == false ]] || die "CPU_DP requires more than one GPU"
+fi
 cudagraph_sizes_csv=1
 for ((capture_size = 2; capture_size < max_num_seqs; capture_size *= 2)); do
   cudagraph_sizes_csv+=",${capture_size}"
 done
 if ((max_num_seqs > 1)); then cudagraph_sizes_csv+=",${max_num_seqs}"; fi
 ((train_batch_size % num_gpus == 0)) || die "Train batch size must be divisible by GPU count"
-if [[ "${TEACHER_FORWARD_OVERLAP}" == true ]] && ((num_gpus != 1 || train_batch_size != 1)); then
-  die "Teacher forward overlap requires one GPU and batch size 1; set TEACHER_FORWARD_OVERLAP=false"
+# A single-GPU token batch is one intact pipeline batch, so its rollout chunk may hold several prompts.
+if [[ "${TEACHER_FORWARD_OVERLAP}" == true && "${TOKEN_BATCHING_ENABLED}" != true ]] && ((train_batch_size != num_gpus)); then
+  die "Teacher forward overlap requires one sequence per GPU (batch size = GPU count); set TEACHER_FORWARD_OVERLAP=false"
 fi
 
 [[ "${num_steps}" == null || "${num_steps}" =~ ^[1-9][0-9]*$ ]] || \
@@ -159,7 +180,11 @@ fi
 
 python_bin="$(resolve_executable "${python_bin}")"
 export CUDA_DEVICE_ORDER=PCI_BUS_ID
-export CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-0}"
+if [[ -z "${CUDA_VISIBLE_DEVICES:-}" ]]; then
+  CUDA_VISIBLE_DEVICES=0
+  for ((gpu = 1; gpu < num_gpus; gpu++)); do CUDA_VISIBLE_DEVICES+=",${gpu}"; done
+fi
+export CUDA_VISIBLE_DEVICES
 export VLLM_USE_V1=1 TOKENIZERS_PARALLELISM=false HYDRA_FULL_ERROR=1
 export PYTHONNOUSERSITE=1
 # The shared-weight integration accesses the original v1 model runner.
@@ -215,6 +240,9 @@ cmd=("${python_bin}" -m verl.trainer.main_ppo
   actor_rollout_ref.rollout.pipeline_overlap="${PIPELINE_OVERLAP}"
   actor_rollout_ref.rollout.cpu_optimizer_threads="${CPU_OPTIMIZER_THREADS}"
   actor_rollout_ref.rollout.pipeline_gradient_offload="${PIPELINE_GRADIENT_OFFLOAD}"
+  actor_rollout_ref.rollout.cpu_dp="${CPU_DP}"
+  actor_rollout_ref.rollout.cpu_dp_owner_rank="${CPU_DP_OWNER_RANK}"
+  actor_rollout_ref.rollout.cpu_dp_node_threads="${CPU_DP_NODE_THREADS}"
   actor_rollout_ref.rollout.teacher_layer_pipeline="${TEACHER_LAYER_PIPELINE}"
   actor_rollout_ref.rollout.teacher_layer_pipeline_max_mb="${TEACHER_LAYER_PIPELINE_MAX_MB}"
   +actor_rollout_ref.rollout.reward_mode=mt_opd

@@ -1035,6 +1035,39 @@ def compute_rewards(token_level_scores, old_log_prob, ref_log_prob, kl_ratio):
     return token_level_scores - kl * kl_ratio
 
 
+_GLOBAL_DENOMINATOR = None
+
+
+class global_loss_denominator:
+    """CPU data parallel: replace local mean denominators by their sum over ranks.
+
+    Inside this context, ``agg_loss`` returns this rank's share of the global
+    objective: sum(local numerator) / sum_over_ranks(denominator). Summing the
+    ranks' gradients (verl.utils.dp_cpu_adam) then yields exactly the gradient of
+    the global-batch token-mean (or sequence-mean) loss. ``reduce`` maps a local
+    scalar denominator tensor to the global one (a gloo all-reduce). Every rank
+    must make the same sequence of agg_loss calls (one fixed micro-batch per step).
+    """
+
+    def __init__(self, reduce):
+        self.reduce = reduce
+
+    def __enter__(self):
+        global _GLOBAL_DENOMINATOR
+        self.previous, _GLOBAL_DENOMINATOR = _GLOBAL_DENOMINATOR, self.reduce
+        return self
+
+    def __exit__(self, *exc):
+        global _GLOBAL_DENOMINATOR
+        _GLOBAL_DENOMINATOR = self.previous
+        return False
+
+
+def _global_masked_mean(values, mask):
+    denominator = _GLOBAL_DENOMINATOR(mask.sum().detach())
+    return verl_F.masked_sum(values, mask) / (denominator + 1e-8)
+
+
 def agg_loss(loss_mat: torch.Tensor, loss_mask: torch.Tensor, loss_agg_mode: str):
     """
     Aggregate the loss matrix into a scalar.
@@ -1050,6 +1083,17 @@ def agg_loss(loss_mat: torch.Tensor, loss_mask: torch.Tensor, loss_agg_mode: str
         loss: `a scalar torch.Tensor`
             aggregated loss
     """
+    if _GLOBAL_DENOMINATOR is not None:
+        if loss_agg_mode == "token-mean":
+            return _global_masked_mean(loss_mat, loss_mask)
+        if loss_agg_mode == "seq-mean-token-sum":
+            seq_losses = torch.sum(loss_mat * loss_mask, dim=-1)
+            return _global_masked_mean(seq_losses, (torch.sum(loss_mask, dim=-1) > 0).float())
+        if loss_agg_mode == "seq-mean-token-mean":
+            counts = torch.sum(loss_mask, dim=-1)
+            seq_losses = torch.sum(loss_mat * loss_mask, dim=-1) / (counts + 1e-8)
+            return _global_masked_mean(seq_losses, (counts > 0).float())
+        # seq-mean-token-sum-norm has a fixed divisor; local sums already add up.
     if loss_agg_mode == "token-mean":
         loss = verl_F.masked_mean(loss_mat, loss_mask)
     elif loss_agg_mode == "seq-mean-token-sum":

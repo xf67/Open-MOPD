@@ -31,7 +31,7 @@ from torch.distributed.tensor import DTensor
 import verl.utils.torch_functional as verl_F
 from verl.utils import chunked_head
 from verl import DataProto
-from verl.trainer.ppo.core_algos import agg_loss, get_policy_loss_fn, kl_penalty
+from verl.trainer.ppo.core_algos import agg_loss, get_policy_loss_fn, global_loss_denominator, kl_penalty
 from verl.utils.attention_utils import index_first_axis, pad_input, rearrange, unpad_input
 from verl.utils.device import get_device_id, get_device_name
 from verl.utils.fsdp_utils import FSDPModule, fsdp2_clip_grad_norm_
@@ -53,6 +53,13 @@ __all__ = ["DataParallelPPOActor", "_compute_delta_opd_rm_scores"]
 
 logger = logging.getLogger(__file__)
 logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "WARN"))
+
+
+def _cpu_dp_allreduce(local):
+    """Sum a scalar loss denominator over ranks on gloo (never NCCL)."""
+    value = local.detach().to("cpu", torch.float64).reshape(1)
+    torch.distributed.all_reduce(value)
+    return value.to(device=local.device, dtype=torch.float32).reshape(())
 
 
 def _actor_update_nvtx(phase: str):
@@ -954,8 +961,9 @@ class DataParallelPPOActor(BasePPOActor):
             if isinstance(grad_norm, DTensor):
                 grad_norm = grad_norm.full_tensor()
 
-        # if grad_norm is not finite, skip the update
-        if not torch.isfinite(grad_norm):
+        # if grad_norm is not finite, skip the update. CPU data parallel decides the skip
+        # globally on the reduced gradient, so every rank must still seal its step.
+        if not torch.isfinite(grad_norm) and not getattr(self.actor_optimizer, "global_step_decision", False):
             print(f"WARN: rank {torch.distributed.get_rank()} grad_norm is not finite: {grad_norm}")
             self.actor_optimizer.zero_grad()
         else:
@@ -1153,6 +1161,17 @@ class DataParallelPPOActor(BasePPOActor):
             raise ValueError("early gradient offload requires one fixed training micro-batch per step")
         on_policy = len(mini_batches) == 1 and self.config.ppo_epochs == 1 and not pipeline
 
+        # CPU data parallel: the ranks' gradients are summed on CPU, so each rank's loss
+        # must be its share of the global objective. With one micro-batch per mini-batch
+        # every mean denominator is all-reduced (exact global token-mean); otherwise fall
+        # back to averaging per-rank losses (DDP semantics).
+        cpu_dp_world = 1
+        if getattr(self.actor_optimizer, "global_step_decision", False):
+            cpu_dp_world = torch.distributed.get_world_size()
+        cpu_dp_exact = cpu_dp_world > 1 and not self.config.use_dynamic_bsz and micro_batch_size >= mini_batch_size
+        if cpu_dp_world > 1 and not cpu_dp_exact:
+            logger.warning("CPU data parallel with several micro-batches per mini-batch: averaging rank losses")
+
         metrics = {}
         for _ in range(self.config.ppo_epochs):
             for batch_idx, mini_batch in enumerate(mini_batches):
@@ -1253,7 +1272,9 @@ class DataParallelPPOActor(BasePPOActor):
                             )
                         log_prob_for_loss = log_prob
 
-                    with _actor_update_nvtx("loss"):
+                    with _actor_update_nvtx("loss"), (
+                        global_loss_denominator(_cpu_dp_allreduce) if cpu_dp_exact else nullcontext()
+                    ):
                         # MT-OPD M1: rebalance each domain's share of the gradient. Applied
                         # here, after M4, so a refreshed advantage still carries the domain
                         # weighting.
@@ -1359,10 +1380,15 @@ class DataParallelPPOActor(BasePPOActor):
                             loss = policy_loss * loss_scale_factor
                         else:
                             loss = policy_loss * loss_scale_factor
+                        if cpu_dp_world > 1 and not cpu_dp_exact:
+                            loss = loss / cpu_dp_world
                     with _actor_update_nvtx("backward"):
                         loss.backward()
 
-                    micro_batch_metrics["actor/pg_loss"] = pg_loss.detach().item() * loss_scale_factor
+                    # Under the global denominator pg_loss is this rank's share; x world estimates the global mean.
+                    micro_batch_metrics["actor/pg_loss"] = (
+                        pg_loss.detach().item() * loss_scale_factor * (cpu_dp_world if cpu_dp_exact else 1)
+                    )
                     append_to_dict(metrics, micro_batch_metrics)
 
                 grad_norm = self._optimizer_step()
