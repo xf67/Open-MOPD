@@ -14,6 +14,7 @@ import torch
 __all__ = [
     "build_domain_weights",
     "select_routed_teacher_logprobs",
+    "select_routed_teacher_masks",
     "compute_domain_share_metrics",
     "compute_teacher_conflict_metrics",
     "compute_domain_loss_weights",
@@ -87,6 +88,25 @@ def select_routed_teacher_logprobs(
     return (w * stacked).sum(dim=0)
 
 
+def select_routed_teacher_masks(
+    teacher_masks: list[torch.Tensor],
+    domain_weights: torch.Tensor,
+) -> torch.Tensor:
+    """Per sample, the routed teacher's ``[T, K]`` mask (top_p_intersec nucleus masks).
+
+    Requires one-hot routing (``domain_routing`` with every domain known): a mask cannot
+    be averaged across teachers.
+    """
+    n = len(teacher_masks)
+    if domain_weights.shape[-1] != n:
+        raise ValueError(f"domain_weights last dim ({domain_weights.shape[-1]}) must equal {n} teachers")
+    if not torch.all((domain_weights == 0) | (domain_weights == 1)) or not torch.all(domain_weights.sum(-1) == 1):
+        raise ValueError("per-teacher masks need one-hot routing (domain_routing, every domain known)")
+    stacked = torch.stack([m.bool() for m in teacher_masks], dim=0)  # [N, B, T, K]
+    route = domain_weights.argmax(dim=-1).to(stacked.device)
+    return stacked[route, torch.arange(route.numel(), device=route.device)]
+
+
 def compute_domain_share_metrics(
     domains: Sequence[str] | np.ndarray | None,
     response_mask: torch.Tensor,
@@ -149,6 +169,8 @@ def compute_domain_share_metrics(
         out[f"{p}/token_share"] = (tok / total_tokens).item()
         out[f"{p}/prompt_count"] = float(idx.numel())
         out[f"{p}/mean_response_length"] = (tok / max(idx.numel(), 1)).item()
+        out[f"{p}/max_response_length"] = per_seq_tokens[idx].max().item()
+        out[f"{p}/median_response_length"] = per_seq_tokens[idx].median().item()
         if reward_per_seq is not None:
             out[f"{p}/reward_abs_mean"] = (
                 reward_per_seq[idx].sum() / tok.clamp(min=1.0)
@@ -340,6 +362,7 @@ def refresh_opd_advantage(
     teacher_on_student_log_probs: torch.Tensor,
     response_mask: torch.Tensor,
     reward_weight_mode: str = "student_p",
+    valid_mask: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """**M4 (AsyncOPD-style).** Rebuild the OPD advantage from the *current* student.
 
@@ -395,10 +418,19 @@ def refresh_opd_advantage(
         raise ValueError(f"Unknown reward_weight_mode: {reward_weight_mode}")
 
     # only_stu has an all-ones valid mask, so the softmax needs no -inf masking.
+    # top_p_intersec / intersection: a fixed [B, T, K] mask of student top-k ids inside
+    # the routed teacher's nucleus (same formula as compute_distillation_reward).
+    diff = s - t
+    if valid_mask is not None:
+        if valid_mask.shape != s.shape:
+            raise ValueError(f"valid_mask {tuple(valid_mask.shape)} must match top-k {tuple(s.shape)}")
+        valid = valid_mask.bool()
+        logits = logits.masked_fill(~valid, -float("inf"))
+        diff = diff.masked_fill(~valid, 0.0)
     weights = torch.exp(logits - torch.logsumexp(logits, dim=-1, keepdim=True))
     weights = torch.nan_to_num(weights, nan=0.0, posinf=0.0, neginf=0.0)
 
-    rm_scores = -(s - t) * weights
+    rm_scores = -diff * weights
     return rm_scores * response_mask.unsqueeze(-1).to(rm_scores.dtype)
 
 

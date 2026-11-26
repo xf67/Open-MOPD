@@ -130,13 +130,21 @@ class FSDPCheckpointManager(BaseCheckpointManager):
             if self.should_load_optimizer
             else None
         )
+        # CPU-Adam pipeline (incl. cpu_dp): masters/moments live on the host, and at resume time
+        # vLLM already holds most of the GPU, so restore saved tensors to CPU first.
+        from verl.utils.cpu_adam_pipeline import CPUAdamPipeline
+
+        host_load = isinstance(self.optimizer, CPUAdamPipeline)
+        # mmap: the owner's FP32 optimizer shard (~36 GB) stays file-backed (reclaimable page cache)
+        # instead of a transient anonymous copy on top of the shared host state.
+        load_kwargs = {"map_location": "cpu", "mmap": True} if host_load else {}
         with get_fsdp_state_ctx(self.model, StateDictType.SHARDED_STATE_DICT, state_dict_cfg, optim_cfg):
             if self.should_load_model:
                 checkpoint_model_path = os.path.join(
                     local_path, f"model_world_size_{self.world_size}_rank_{self.rank}.pt"
                 )
                 local_model_path = copy_to_local(checkpoint_model_path)
-                model_state_dict = torch.load(local_model_path, weights_only=False)
+                model_state_dict = torch.load(local_model_path, weights_only=False, **load_kwargs)
                 self.model.load_state_dict(model_state_dict)
                 log_with_rank(f"Loaded model from {checkpoint_model_path}", rank=self.rank, logger=logger)
 
@@ -145,7 +153,7 @@ class FSDPCheckpointManager(BaseCheckpointManager):
                     local_path, f"optim_world_size_{self.world_size}_rank_{self.rank}.pt"
                 )
                 local_optim_path = copy_to_local(checkpoint_optim_path)
-                optimizer_state_dict = torch.load(local_optim_path, weights_only=False)
+                optimizer_state_dict = torch.load(local_optim_path, weights_only=False, **load_kwargs)
                 self.optimizer.load_state_dict(optimizer_state_dict)
                 log_with_rank(f"Loaded optimizer from {checkpoint_optim_path}", rank=self.rank, logger=logger)
 

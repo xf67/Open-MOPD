@@ -18,6 +18,7 @@ import inspect
 import logging
 import math
 import os
+from contextlib import contextmanager
 from datetime import datetime
 from pathlib import Path
 
@@ -42,10 +43,41 @@ def set_gpu_memory_limit(limit_gb: float) -> None:
     budget_bytes = min(int(limit_gb * 1024**3), physical_bytes)
     allocator_bytes = budget_bytes - 1024**3
     torch.cuda.set_per_process_memory_fraction(allocator_bytes / physical_bytes, device)
+    _ALLOCATOR_LIMIT_BYTES[device] = allocator_bytes
     logger.warning(
         "GPU budget %.2f GiB: PyTorch allocator %.2f GiB, CUDA/NCCL headroom 1 GiB",
         budget_bytes / 1024**3, allocator_bytes / 1024**3,
     )
+
+
+_ALLOCATOR_LIMIT_BYTES = {}  # device -> allocator cap set by set_gpu_memory_limit
+
+
+@contextmanager
+def unbacked_memory_allowance():
+    """Raise the allocator cap by memory PyTorch counts but the GPU does not back; restore it on exit.
+
+    vLLM's sleep allocator unmaps the KV cache's physical pages but its blocks stay allocated in a
+    PyTorch pool, so the per-process cap set by ``set_gpu_memory_limit`` keeps counting the slept KV
+    cache and training gets ~kv_cache_memory_bytes less than the budget. Inside this context the cap
+    grows by ``memory_reserved - (total - free)``: a lower bound on the unbacked bytes (the CUDA
+    context is in the physical figure only), so backed allocations stay within the budget. The
+    training phase's cached blocks are returned before vLLM wakes (rollout_mode with
+    OPENMOPD_RELEASE_CACHE=1). Yields the allowance in bytes (0 without a cap).
+    """
+    device = torch.cuda.current_device()
+    base = _ALLOCATOR_LIMIT_BYTES.get(device)
+    if base is None:
+        yield 0
+        return
+    physical = torch.cuda.get_device_properties(device).total_memory
+    free, total = torch.cuda.mem_get_info(device)
+    unbacked = max(0, torch.cuda.memory_reserved(device) - (total - free))
+    torch.cuda.set_per_process_memory_fraction(min(1.0, (base + unbacked) / physical), device)
+    try:
+        yield unbacked
+    finally:
+        torch.cuda.set_per_process_memory_fraction(base / physical, device)
 
 
 # 这个的gc collect很慢，下面注释掉了

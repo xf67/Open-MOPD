@@ -22,6 +22,7 @@ import json
 import os
 import uuid
 from collections import defaultdict
+from contextlib import contextmanager
 from copy import deepcopy
 from dataclasses import dataclass, field
 from pprint import pprint
@@ -67,10 +68,124 @@ from verl.utils.checkpoint.checkpoint_manager import (
     should_save_ckpt_esi,
 )
 from verl.utils.config import omega_conf_to_dataclass
-from verl.utils.debug import marked_timer
+from verl.utils.debug import marked_timer as _marked_timer
 from verl.utils.metric import reduce_metrics
 from verl.utils.rollout_skip import RolloutSkip
 from verl.utils.seqlen_balancing import calculate_workload, get_seqlen_balanced_partitions, log_seqlen_unbalance
+
+
+@contextmanager
+def marked_timer(name, timing_raw, *args, **kwargs):
+    """verl's marked_timer; with OPENMOPD_PHASE_LOG=1 it also prints wall-clock phase boundaries and the
+    driver's RSS / host MemAvailable, to line phases up with the host-memory sampler."""
+    if os.environ.get("OPENMOPD_PHASE_LOG", "0") != "1":
+        with _marked_timer(name, timing_raw, *args, **kwargs):
+            yield
+        return
+    import time
+
+    import psutil
+
+    def mark(event):
+        rss = psutil.Process().memory_info().rss / 1024**3
+        avail = psutil.virtual_memory().available / 1024**3
+        print(f"[phase] {time.strftime('%H:%M:%S')} {name} {event} driver_rss={rss:.1f} avail={avail:.1f}",
+              flush=True)
+
+    mark("start")
+    try:
+        with _marked_timer(name, timing_raw, *args, **kwargs):
+            yield
+    finally:
+        mark("end")
+
+
+# Names fit() binds to one step's data. They are rebound only partway into the next step, so without a
+# release the previous step's tensors (scoring outputs, including keys already popped from `batch`) stay
+# alive while the next step's arrive: ~30 GB of driver memory at batch 1024 x 16K x top-16.
+_STEP_DATA_NAMES = (
+    "batch_dict", "batch", "gen_batch", "gen_batch_output", "scoring_output", "teacher_data", "opd_output",
+    "distillation_output", "delta_output", "rm_scores", "old_log_prob", "ref_log_prob", "values",
+    "actor_output", "reward_extra_infos_dict", "opd_tensors", "teacher_ref_tensors",
+)
+
+
+def _data_nbytes(value):
+    if isinstance(value, torch.Tensor):
+        return value.untyped_storage().nbytes()  # 0 once released
+    if isinstance(value, np.ndarray):
+        return value.nbytes
+    if isinstance(value, DataProto):
+        tensors = 0 if value.batch is None else sum(_data_nbytes(value.batch[k]) for k in value.batch.keys())
+        return tensors + sum(_data_nbytes(v) for v in (value.non_tensor_batch or {}).values())
+    if isinstance(value, dict):
+        return sum(_data_nbytes(v) for v in value.values())
+    return 0
+
+
+def _report_step_data(frame_locals, label):
+    """Print the locals holding >= 64 MiB (tensors shared between objects are counted once per holder)."""
+    import psutil
+
+    big = sorted(((n, _data_nbytes(v)) for n, v in frame_locals.items()), key=lambda item: -item[1])
+    held = ", ".join(f"{n}={b / 1024**3:.2f}" for n, b in big if b >= 64 * 1024**2) or "none"
+    rss = psutil.Process().memory_info().rss / 1024**3
+    print(f"[step-data] {label}: driver_rss={rss:.1f} GiB; locals >= 64 MiB (GiB): {held}", flush=True)
+
+
+def _topk_analysis_stride(rows):
+    """Row stride of the large-batch top-k diagnostics: every n-th row, about OPENMOPD_TOPK_ANALYSIS_ROWS
+    (default 256) rows in all; 0 or less analyses every row."""
+    target = int(os.environ.get("OPENMOPD_TOPK_ANALYSIS_ROWS", "256"))
+    return max(1, -(-rows // target)) if target > 0 else 1
+
+
+def _release_step_data(frame_locals, keep_batch=False):
+    """Free this step's data in place, so every name still bound to it holds nothing.
+
+    DataProtos and dicts in _STEP_DATA_NAMES are emptied. Bare tensors left bound by the step's metric code
+    ([rows, T, K] temporaries such as student_p / adv_for_max, ~16 x 1 GiB at batch 1024 x 16K x 16, and
+    aliases of batch columns) get their storage resized to 0 when their first dimension is the step's row
+    count (or the top-k diagnostics' sample, `topk_analysis_rows`) and they hold >= 64 MiB.
+
+    keep_batch=False: end of step, nothing of the step is used afterwards.
+    keep_batch=True: before the update_actor dispatch, after which the step reads only `batch` (and
+    actor_output / metrics): `batch` and every tensor sharing storage with it are kept.
+    """
+    import gc
+
+    step_batch = frame_locals.get("batch")
+    has_batch = isinstance(step_batch, DataProto) and step_batch.batch is not None
+    rows = len(step_batch) if has_batch else None
+    kept = set()
+    if keep_batch and has_batch:
+        kept = {step_batch.batch[k].untyped_storage().data_ptr() for k in step_batch.batch.keys()}
+    for name in _STEP_DATA_NAMES:
+        value = frame_locals.get(name)
+        if keep_batch and value is step_batch:
+            continue
+        if isinstance(value, DataProto):
+            value.batch = None
+            value.non_tensor_batch = {}
+        elif isinstance(value, dict):
+            value.clear()
+    if rows:
+        row_counts = {rows, frame_locals.get("topk_analysis_rows") or rows}
+        for value in frame_locals.values():
+            if (
+                isinstance(value, torch.Tensor)
+                and value.dim() >= 2
+                and value.shape[0] in row_counts
+                and value.nbytes >= 64 * 1024**2
+            ):
+                storage = value.untyped_storage()
+                if storage.data_ptr() == 0 or storage.data_ptr() in kept:
+                    continue
+                try:
+                    storage.resize_(0)
+                except RuntimeError:
+                    pass  # storage not owned by torch (e.g. from numpy): leave it to the next rebind
+    gc.collect()
 from verl.utils.step_memory import reduce_step_memory_metrics
 from verl.utils.token_batch import RolloutTokenAccumulator, validate_token_batching
 from verl.utils.torch_functional import masked_mean
@@ -646,12 +761,34 @@ class RayPPOTrainer:
         self.use_mt_opd = self.reward_mode == "mt_opd"
         self.teacher_forward_overlap = self.config.actor_rollout_ref.rollout.get("teacher_forward_overlap", False)
         self.student_teacher_pipeline = self.config.actor_rollout_ref.rollout.get("student_teacher_pipeline", False)
+        # Large-batch mode (cpu_dp): several scoring micro-batches, accumulation micro-batches and
+        # synchronous updates per step; additionally supports top_p_intersec.
+        self.large_batch = bool(self.config.actor_rollout_ref.rollout.get("large_batch", False))
+        _pipeline_strategies = ("only_stu", "top_p_intersec") if self.large_batch else ("only_stu",)
         if self.student_teacher_pipeline and (
             not self.use_mt_opd or not self.use_rm or not self.teacher_forward_overlap
-            or self.config.actor_rollout_ref.rollout.get("top_k_strategy", "only_stu") != "only_stu"
+            or self.config.actor_rollout_ref.rollout.get("top_k_strategy", "only_stu") not in _pipeline_strategies
             or self.config.algorithm.adv_estimator != "token_reward_direct"
         ):
-            raise ValueError("student teacher pipeline requires MT-OPD, only_stu, token_reward_direct and joint scoring")
+            raise ValueError(
+                f"student teacher pipeline requires MT-OPD, top_k_strategy in {_pipeline_strategies}, "
+                "token_reward_direct and joint scoring"
+            )
+        if self.large_batch and not self.student_teacher_pipeline:
+            raise ValueError("rollout.large_batch requires the student/teacher pipeline")
+        # Per-domain training response limit (validation keeps one limit), as parallel lists:
+        # +data.response_length_domains=[math,code,if] +data.response_length_values=[16384,16384,2048]
+        self.domain_max_tokens = None
+        _rd = OmegaConf.select(self.config, "data.response_length_domains")
+        _rv = OmegaConf.select(self.config, "data.response_length_values")
+        if _rd is not None or _rv is not None:
+            _rd = [str(d) for d in OmegaConf.to_container(_rd, resolve=True)]
+            _rv = [int(v) for v in OmegaConf.to_container(_rv, resolve=True)]
+            if len(_rd) != len(_rv) or not _rd:
+                raise ValueError("data.response_length_domains/values must be non-empty parallel lists")
+            if max(_rv) > int(self.config.data.max_response_length) or min(_rv) < 1:
+                raise ValueError("per-domain response lengths must be in [1, data.max_response_length]")
+            self.domain_max_tokens = dict(zip(_rd, _rv, strict=True))
         if self.teacher_forward_overlap and (not self.use_mt_opd or not self.use_rm):
             raise ValueError("teacher_forward_overlap currently requires MT-OPD with a reward model")
         if self.config.actor_rollout_ref.rollout.get("teacher_layer_pipeline", False) and (
@@ -1805,8 +1942,13 @@ class RayPPOTrainer:
             self.config, is_validation=True
         )
         if can_validate and self.config.trainer.get("val_before_train", True):
-            val_metrics = self._validate()
+            val_timing = {}
+            with marked_timer("testing", val_timing):
+                val_metrics = self._validate()
             assert val_metrics, f"{val_metrics=}"
+            if self.large_batch:
+                val_metrics["timing_s/testing"] = val_timing["testing"]
+                print(f"[val_before_train] timing_s/testing:{val_timing['testing']:.1f}", flush=True)
             pprint(f"Initial validation metrics: {val_metrics}")
             logger.log(data=val_metrics, step=self.global_steps)
             if self.config.trainer.get("val_only", False):
@@ -1967,6 +2109,14 @@ class RayPPOTrainer:
                 )
 
                 gen_batch = self._get_gen_batch(batch)
+                if self.domain_max_tokens is not None:
+                    domains = batch.non_tensor_batch.get("domain", None)
+                    if domains is None:
+                        raise ValueError("per-domain response lengths require non_tensor_batch['domain']")
+                    default_tokens = int(self.config.data.max_response_length)
+                    gen_batch.non_tensor_batch["rollout_max_tokens"] = np.array(
+                        [self.domain_max_tokens.get(str(d), default_tokens) for d in domains], dtype=object
+                    )
 
                 # pass global_steps to trace
                 gen_batch.meta_info["global_steps"] = self.global_steps
@@ -2094,6 +2244,12 @@ class RayPPOTrainer:
                                     scoring_output = self.actor_rollout_wg.compute_log_prob_and_teacher(batch)
                                 else:
                                     scoring_output = self.actor_rollout_wg.compute_log_prob(batch)
+                                scoring_rank_metrics = scoring_output.meta_info.pop("metrics", None)
+                                if scoring_rank_metrics:
+                                    for _k, _v in scoring_rank_metrics.items():
+                                        _v = _v if isinstance(_v, list) else [_v]
+                                        metrics[f"{_k}_max"] = float(max(_v))
+                                        metrics[f"{_k}_sum"] = float(sum(_v))
                                 batch = batch.union(scoring_output)
 
                             if not self.teacher_forward_overlap:
@@ -2249,6 +2405,19 @@ class RayPPOTrainer:
                                 routed_lp = select_routed_teacher_logprobs(
                                     teacher_logps, domain_weights
                                 )
+                                if "mt_teacher_1_overlap_mask" in batch.batch.keys():
+                                    # top_p_intersec: each teacher scored its own nucleus mask;
+                                    # keep the routed teacher's per sample (one-hot routing only).
+                                    from verl.workers.actor.mt_opd import select_routed_teacher_masks
+
+                                    teacher_masks = [batch.batch["overlap_mask"]] + [
+                                        batch.batch[f"mt_teacher_{j}_overlap_mask"]
+                                        for j in range(1, len(teacher_logps))
+                                    ]
+                                    batch.batch["overlap_mask"] = select_routed_teacher_masks(
+                                        teacher_masks, domain_weights
+                                    )
+                                    del teacher_masks
                                 # M3: teachers already scored every token; use their
                                 # agreement instead of discarding it. Must happen before
                                 # compute_distillation_reward, which consumes this key.
@@ -2296,6 +2465,12 @@ class RayPPOTrainer:
                                         domains=domains,
                                     )
                                 )
+                                if self.large_batch:
+                                    # Host memory: only the routed teacher tensors are used from here on.
+                                    del teacher_logps
+                                    for _key in list(batch.batch.keys()):
+                                        if _key.startswith("mt_teacher_"):
+                                            batch.batch.pop(_key)
 
                                 # M1: rebalance gradient share across domains. Computed
                                 # here because this is where domain labels live, and
@@ -2745,6 +2920,19 @@ class RayPPOTrainer:
                             overlong_filter=self.config.algorithm.get("overlong_filter", False),
                         )
  
+
+                        # Large-batch mode: the top-k diagnostics below read a strided row sample of `batch`
+                        # (views), so their [rows, T, K] temporaries on the driver are 1/stride of the full
+                        # batch's (~16 GB at 1024 x 16K x top-16, the host peak of the step). `batch` is restored
+                        # right after the block.
+                        full_batch = batch
+                        topk_analysis_rows = None
+                        if self.large_batch:
+                            stride = _topk_analysis_stride(len(batch))
+                            if stride > 1:
+                                batch = full_batch[::stride]
+                                topk_analysis_rows = len(batch)
+                                metrics["mt_opd/topk_analysis_rows"] = topk_analysis_rows
 
                         # --- Top-K Metrics Analysis (Chunked) ---
                         if "overlap_mask" in batch.batch.keys() and "advantages" in batch.batch.keys():
@@ -3406,7 +3594,9 @@ class RayPPOTrainer:
                                 print(f"Error computing Top-K metrics: {e}")
                                 import traceback
                                 traceback.print_exc()
-                    
+                        batch = full_batch
+                        del full_batch
+
                     if self.config.trainer.get("is_plot", False) and (self.global_steps == 1 or self.global_steps % 10 == 0):
                         try:
                             import matplotlib.pyplot as plt
@@ -3606,6 +3796,10 @@ class RayPPOTrainer:
                             or self.config.actor_rollout_ref.actor.get("opd_refresh_advantage", False)
                         ):
                             continue  # The learner refreshes OPD against its current weights.
+                        if key == "overlap_mask" and self.large_batch and (
+                            self.config.actor_rollout_ref.rollout.get("top_k_strategy") == "top_p_intersec"
+                        ):
+                            continue  # The refresh needs the routed teacher's fixed nucleus mask.
                         if key in batch.batch.keys():
                             batch.batch.pop(key)
 
@@ -3644,7 +3838,24 @@ class RayPPOTrainer:
                                 else:
                                     metrics["actor/adaptive_kl_loss_missing_reward"] = 1
                             batch.meta_info["actor_kl_loss_coef"] = float(actor_config.kl_loss_coef)
-                            actor_output = self.actor_rollout_wg.update_actor(batch)
+                            if self.large_batch:
+                                # Free what the rest of the step does not read before serializing the
+                                # dispatch (scoring keys popped from batch, metric temporaries: ~20 GB).
+                                _release_step_data(locals(), keep_batch=True)
+                                if os.environ.get("OPENMOPD_PHASE_LOG", "0") == "1":
+                                    _report_step_data(locals(), "before update_actor")
+                                # Send only what update_policy reads (host memory / serialization).
+                                _actor_keys = [k for k in (
+                                    "responses", "response_mask", "input_ids", "attention_mask", "position_ids",
+                                    "old_log_probs", "advantages", "ref_log_prob", "rollout_is_weights",
+                                    "format_mask", "domain_loss_weight", "student_top_k_log_probs",
+                                    "teacher_on_student_log_probs", "student_top_k_ids", "overlap_mask",
+                                ) if k in batch.batch.keys()]
+                                actor_output = self.actor_rollout_wg.update_actor(
+                                    batch.select(batch_keys=_actor_keys, non_tensor_batch_keys=[])
+                                )
+                            else:
+                                actor_output = self.actor_rollout_wg.update_actor(batch)
                         actor_output_metrics = reduce_metrics(actor_output.meta_info["metrics"])
                         metrics.update(actor_output_metrics)
 
@@ -3763,6 +3974,10 @@ class RayPPOTrainer:
                 if hasattr(self.train_dataset, "on_batch_end"):
                     # The dataset may be changed after each training batch
                     self.train_dataset.on_batch_end(batch=batch)
+                if self.large_batch:
+                    _release_step_data(locals())
+                    if os.environ.get("OPENMOPD_PHASE_LOG", "0") == "1":
+                        _report_step_data(locals(), "after end-of-step release")
             if self.token_batching and self.global_steps == epoch_start_step:
                 raise ValueError("No rollout batch exceeded data.token_batching.min_tokens in this epoch")
         if self.token_batching and self.global_steps <= self.total_training_steps:

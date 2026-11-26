@@ -59,7 +59,7 @@ _CHUNK = 1 << 20
 
 
 def _node_worker(connection, node, cpus, threads, world, stage_dtype, total, part, host_specs, opt_specs, meta,
-                 group_count):
+                 group_count, stage_name="stage"):
     """One NUMA node's share of reduction and AdamW. CPUAdam holds the GIL, hence a process."""
     start_memory_monitor()
     try:
@@ -70,7 +70,8 @@ def _node_worker(connection, node, cpus, threads, world, stage_dtype, total, par
 
         lo, hi = part
         stages = [
-            shared_host.open_arena(f"{_PREFIX}stage{r}", [("g", (total,), stage_dtype)], create=False)["g"][lo:hi]
+            shared_host.open_arena(f"{_PREFIX}{stage_name}{r}", [("g", (total,), stage_dtype)],
+                                   create=False)["g"][lo:hi]
             for r in range(world)
         ]
         host = shared_host.open_arena(f"{_PREFIX}host", host_specs, create=False)
@@ -145,7 +146,8 @@ class SharedCPUAdamPipeline(CPUAdamPipeline):
     global_step_decision = True  # the actor must call step() on every rank; skips are decided globally
 
     def __init__(self, optimizer, model, overlap=True, threads=8, gradient_offload=True,
-                 async_update=None, fp32_gradients=False, owner_rank=0, node_threads=None):
+                 async_update=None, fp32_gradients=False, owner_rank=0, node_threads=None,
+                 accumulate=False, ring_slots=4):
         from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
         from torch.distributed.fsdp._runtime_utils import _lazy_init
 
@@ -157,7 +159,10 @@ class SharedCPUAdamPipeline(CPUAdamPipeline):
             raise ValueError("SharedCPUAdamPipeline must be constructed before any optimizer updates")
         if not isinstance(model, FSDP) or threads < 1:
             raise ValueError("SharedCPUAdamPipeline requires FSDP1 and a positive CPU thread count")
+        if accumulate and async_update is not False:
+            raise ValueError("gradient accumulation (large_batch) requires cpu_adam_async=false")
         self.backend = "cpu"
+        self.accumulate = accumulate
         self.fp32_gradients = fp32_gradients
         self.rank = dist.get_rank()
         self.world = dist.get_world_size()
@@ -214,14 +219,20 @@ class SharedCPUAdamPipeline(CPUAdamPipeline):
                 name, flat = storage[param.untyped_storage().data_ptr()]
                 table.append((param, gi, name, param.storage_offset() - flat.storage_offset()))
         self.total = sum(p.numel() for p, *_ in table)
-        stage_dtype = torch.float32 if fp32_gradients else torch.bfloat16
+        grad_dtype = torch.float32 if fp32_gradients else torch.bfloat16
+        # Accumulation: the per-rank stage is an FP32 accumulator written by the CPU (not
+        # CUDA-registered); gradients land in a small pinned ring first. Otherwise the stage
+        # receives the gradient DMA directly in the gradient dtype.
+        stage_dtype = torch.float32 if accumulate else grad_dtype
+        self.stage_name = "accum" if accumulate else "stage"
 
         # --- per-rank gradient staging on the rank's NUMA node; only its writer registers it
         stage = None
         for r in range(self.world):
             arena = shared_host.shared_arena(
-                f"{_PREFIX}stage{r}", [("g", (self.total,), stage_dtype)], creator=r,
-                policy=f"node:{self.node}" if r == self.rank else None, attach=False, register=True,
+                f"{_PREFIX}{self.stage_name}{r}", [("g", (self.total,), stage_dtype)], creator=r,
+                policy=f"node:{self.node}" if r == self.rank else None, attach=False,
+                register=not accumulate,
             )
             if r == self.rank:
                 stage = arena["g"]
@@ -244,6 +255,7 @@ class SharedCPUAdamPipeline(CPUAdamPipeline):
             self.state[param] = {"step": 0}
             offset += numel
         self.shared_gradients = []
+        self.stage_flat = stage
 
         # Start from identical weights everywhere (all ranks loaded the same checkpoint;
         # this also guards against nondeterministic initialization).
@@ -288,6 +300,134 @@ class SharedCPUAdamPipeline(CPUAdamPipeline):
 
         for name, module in self.modules.items():
             self.forward_hooks.append(module.register_forward_hook(partial(self._arm_gradient_offload, name)))
+        if accumulate:
+            self._init_accumulation(grad_dtype, ring_slots)
+
+    # ------------------------------------------------------------------ FP32 accumulation
+    def _init_accumulation(self, grad_dtype, ring_slots):
+        """Pinned landing ring + one accumulate thread per rank (large-batch mode).
+
+        Backward hook: layer gradient -> free ring slot (D2H on copy_stream) -> queue. The
+        accumulate thread waits for the copy, then copies (first micro-batch of the
+        mini-batch) or adds the slot into this rank's FP32 accumulator and frees the slot.
+        """
+        import queue
+
+        if ring_slots < 1:
+            raise ValueError("accum_ring_slots must be positive")
+        starts, acc = [], 0
+        for param, *_ in self.pairs:
+            starts.append(acc)
+            acc += param.numel()
+        self.param_starts = starts
+        largest = max(sum(self.pairs[i][0].numel() for i in indices) for indices in self.layer_indices.values())
+        template = torch.empty((largest,), dtype=grad_dtype, device="meta")
+        from verl.utils.pinned_memory import empty_pinned_like
+
+        self.ring = [empty_pinned_like(template) for _ in range(ring_slots)]
+        self.free_slots = queue.Queue()
+        for slot in range(ring_slots):
+            self.free_slots.put(slot)
+        self.accum_queue = queue.Queue()
+        self.accum_written = set()  # parameter indices written in the current mini-batch
+        self.accum_error = None
+        self.accum_seconds = 0.0
+        self.accum_wait_slot_seconds = 0.0
+        self.local_sumsq = None
+        self.microbatches = 0
+        self.accum_thread = threading.Thread(target=self._accumulate_loop, name="cpu-dp-accumulate", daemon=True)
+        self.accum_thread.start()
+
+    def begin_microbatch(self):
+        """Call before each training micro-batch forward: one hook firing per layer per backward."""
+        if not self.accumulate:
+            return
+        self._check_accumulate()
+        self.gradient_layers.clear()
+        self.microbatches += 1
+
+    def _check_accumulate(self):
+        if self.accum_error is not None:
+            raise RuntimeError(f"CPU DP gradient accumulation failed:\n{self.accum_error}")
+
+    @torch.no_grad()
+    def _accumulate_loop(self):
+        threads = torch.get_num_threads()
+        torch.set_num_threads(threads)
+        while True:
+            item = self.accum_queue.get()
+            try:
+                if item is None:
+                    return
+                slot, ready, entries = item
+                if self.accum_error is None:
+                    ready.synchronize()
+                    start = time.perf_counter()
+                    buffer = self.ring[slot]
+                    for index, offset, numel in entries:
+                        begin = self.param_starts[index]
+                        destination = self.stage_flat[begin:begin + numel]
+                        source = buffer[offset:offset + numel]
+                        if index in self.accum_written:
+                            destination.add_(source)
+                        else:
+                            destination.copy_(source)
+                            self.accum_written.add(index)
+                    self.accum_seconds += time.perf_counter() - start
+            except BaseException:
+                self.accum_error = traceback.format_exc()
+            finally:
+                if item is not None:
+                    self.free_slots.put(item[0])
+                self.accum_queue.task_done()
+
+    @torch.no_grad()
+    def _offload_layer_gradient(self, name, module, *unused):
+        if not self.accumulate:
+            return super()._offload_layer_gradient(name, module, *unused)
+        self.backward_hooks.pop(name).remove()
+        if name in self.gradient_layers:
+            raise RuntimeError(f"layer {name or 'root'}: more than one AccumulateGrad per backward")
+        if self.pending is not None or self.future is not None or not module._sync_gradients:
+            raise RuntimeError("publish the previous CPU update before a synchronized backward")
+        self._check_accumulate()
+        self.gradient_layers.add(name)
+        handle = module._handle
+        live = [(i, self.pairs[i][0].grad) for i in self.layer_indices[name] if self.pairs[i][0].grad is not None]
+        if live:
+            with torch.cuda.stream(module._post_backward_stream):
+                norms = torch._foreach_norm([g for _, g in live], 2.0)
+                sumsq = torch.stack(norms).float().square().sum()
+                self.local_sumsq = sumsq if self.local_sumsq is None else self.local_sumsq + sumsq
+            start = time.perf_counter()
+            slot = self.free_slots.get()  # blocks while every landing slot is still being accumulated
+            self.accum_wait_slot_seconds += time.perf_counter() - start
+            buffer = self.ring[slot]
+            self.copy_stream.wait_stream(module._post_backward_stream)
+            entries, offset = [], 0
+            with torch.cuda.stream(self.copy_stream), torch.cuda.nvtx.range(
+                f"openmopd::io::d2h::actor_gradients::{name or 'root'}"
+            ):
+                for i, gradient in live:
+                    numel = gradient.numel()
+                    buffer[offset:offset + numel].view(gradient.shape).copy_(gradient, non_blocking=True)
+                    gradient.record_stream(self.copy_stream)
+                    entries.append((i, offset, numel))
+                    offset += numel
+                ready = torch.cuda.Event()
+                ready.record(self.copy_stream)
+            self.accum_queue.put((slot, ready, entries))
+        handle.flat_param.grad = None
+        handle._use_unsharded_grad_views()
+
+    def _seal_accumulation(self):
+        """Drain the accumulate thread; returns the parameter indices this rank wrote."""
+        with torch.cuda.nvtx.range("openmopd::cpu::accumulate_drain"):
+            self.accum_queue.join()
+        self._check_accumulate()
+        live = sorted(self.accum_written)
+        self.accum_written = set()
+        return live
 
     # ------------------------------------------------------------------ owner setup
     def _start_node_workers(self, table, host_specs, stage_dtype, threads):
@@ -334,7 +474,7 @@ class SharedCPUAdamPipeline(CPUAdamPipeline):
             process = context.Process(
                 target=_node_worker,
                 args=(child, node, nodes[node] if len(nodes) > 1 else None, threads, self.world, stage_dtype,
-                      self.total, (lo, hi), host_specs, opt_specs, meta, group_count),
+                      self.total, (lo, hi), host_specs, opt_specs, meta, group_count, self.stage_name),
                 name=f"openmopd-dp-adam-node{node}", daemon=True,
             )
             process.start()
@@ -357,6 +497,12 @@ class SharedCPUAdamPipeline(CPUAdamPipeline):
         self.max_norm = float(max_norm)
         for module in self.modules.values():
             torch.cuda.current_stream(self.device).wait_stream(module._post_backward_stream)
+        if self.accumulate:
+            # Root-sum-square of the micro-batch gradient norms (diagnostic only; the
+            # clip coefficient is computed by the owner from the reduced FP32 gradient).
+            if self.local_sumsq is None:
+                return torch.zeros((), device=self.device)
+            return self.local_sumsq.sqrt()
         norms = [self.gradient_norms[i] for i in sorted(self.gradient_norms)]
         if not norms:
             return torch.zeros((), device=self.device)
@@ -370,9 +516,21 @@ class SharedCPUAdamPipeline(CPUAdamPipeline):
             raise RuntimeError("previous CPU update has not been published")
         if self.max_norm is None:
             raise RuntimeError("call clip_grad_norm_ before step")
-        produced = torch.cuda.Event()
-        produced.record(self.copy_stream)
-        live = sorted(self.gradient_norms)
+        if self.accumulate:
+            produced = None
+            live = self._seal_accumulation()
+            self.local_sumsq = None
+            self.last_accumulate_metrics = {
+                "cpu_dp/accumulate_seconds": self.accum_seconds,
+                "cpu_dp/accumulate_wait_slot_seconds": self.accum_wait_slot_seconds,
+                "cpu_dp/microbatches_per_update": float(self.microbatches),
+            }
+            self.accum_seconds = self.accum_wait_slot_seconds = 0.0
+            self.microbatches = 0
+        else:
+            produced = torch.cuda.Event()
+            produced.record(self.copy_stream)
+            live = sorted(self.gradient_norms)
         self.seq += 1
         options = [self._options(group) for group in self.param_groups]
         self.pending = (None, produced, live, self.max_norm, options)
@@ -387,7 +545,8 @@ class SharedCPUAdamPipeline(CPUAdamPipeline):
 
     @torch.no_grad()
     def _signal_ready(self, produced, live, seq):
-        produced.synchronize()
+        if produced is not None:
+            produced.synchronize()
         flags = torch.zeros(len(self.pairs), dtype=torch.uint8)
         if live:
             flags[torch.tensor(live, dtype=torch.long)] = 1
@@ -409,6 +568,7 @@ class SharedCPUAdamPipeline(CPUAdamPipeline):
                 "pipeline/cpu_optimizer_seconds": time.perf_counter() - start,
                 "cpu_dp/global_grad_norm": float(floats[0]),
                 "cpu_dp/skipped": float(floats[1]),
+                **getattr(self, "last_accumulate_metrics", {}),
             }
             return
         ready_flags = self.ctrl["ready"]
@@ -444,6 +604,7 @@ class SharedCPUAdamPipeline(CPUAdamPipeline):
             "pipeline/cpu_adam_native_seconds": adam_seconds,
             "cpu_dp/global_grad_norm": total_norm,
             "cpu_dp/skipped": 0.0 if finite else 1.0,
+            **getattr(self, "last_accumulate_metrics", {}),
         }
 
     # ------------------------------------------------------------------ checkpoints
@@ -482,6 +643,9 @@ class SharedCPUAdamPipeline(CPUAdamPipeline):
         if self.is_owner:
             self.ctrl["published"][0] = self.seq
             self.ctrl["ready"].fill_(self.seq)
+            steps = [int(self.state[p]["step"]) for p, *_ in self.pairs]
+            print(f"[cpu_dp] resumed optimizer: version {self.version}, seq {self.seq}, "
+                  f"adam steps {min(steps)}..{max(steps)}, lr {self.param_groups[0]['lr']}", flush=True)
         shared_host.cpu_barrier()
         # Every replica restarts from the restored shared weights.
         for name, destination in self.gpu_weights.items():
@@ -496,6 +660,9 @@ class SharedCPUAdamPipeline(CPUAdamPipeline):
                 hook.remove()
             self.executor.shutdown(wait=True)
             self.signal_executor.shutdown(wait=True)
+            if getattr(self, "accumulate", False):
+                self.accum_queue.put(None)
+                self.accum_thread.join(timeout=60)
             for process, connection in self.workers:
                 if process.is_alive():
                     connection.send(None)

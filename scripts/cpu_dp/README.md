@@ -63,6 +63,107 @@ python scripts/cpu_dp/mem_sampler.py LOG 5                             # per-pro
 python scripts/cpu_dp/summarize_run.py LOG [LOG ...]                   # step metrics summary
 ```
 
+## Large-batch mode (Open-MOPD recipe: batch 1024, mini-batch 256, 16K responses)
+
+`actor_rollout_ref.rollout.large_batch=true` (`LARGE_BATCH=true` in `r2.sh`; requires
+`cpu_adam_async=false` and the student/teacher pipeline) lifts the one-sequence-per-GPU limits.
+Default single-GPU and cpu_dp behaviour is unchanged when it is off.
+
+* **Scoring** (`fsdp_workers._score_large_batch`): each rank's batch is cut into contiguous
+  micro-batches with `rows x (longest prompt + longest response) <= rollout.scoring_token_budget`
+  (padded positions: the primary teacher's forward-overlap path uses the padded layout).
+  Each micro-batch is compacted to its own columns, scored by one S->T0->T1->T2->S slot cycle
+  (`_score_cycle`, the former single-cycle body), moved to host and re-padded to the batch's
+  response width. Teacher top-k ids/log-probs are not returned; student top-k ids travel as int32,
+  masks as bool. `OPENMOPD_SCORING_CHECK=1` re-scores the rank batch in one cycle and logs
+  `scoring_check/*` (test 4).
+* **FP32 host accumulation** (`dp_cpu_adam.SharedCPUAdamPipeline(accumulate=True)`): the per-rank
+  stage is an FP32 arena `student_accum{r}` (node-local, not CUDA-registered). Backward hooks copy
+  each layer's BF16 gradient into a free slot of a pinned landing ring (`rollout.accum_ring_slots`,
+  each slot = largest FSDP flat parameter), and one accumulate thread per rank copies (first
+  micro-batch of the mini-batch) or adds the slot into the accumulator. `step()` drains the thread,
+  zeroes never-written parameters and signals the owner, whose node workers reduce the four FP32
+  accumulators in rank order, clip by the global norm and run CPUAdam (unchanged). A layer whose
+  hook fires twice in one backward raises (checks gradient checkpointing).
+* **Several synchronous updates per step** (`dp_actor.update_policy`): mini-batches of
+  `ppo_mini_batch_size / world` sequences per rank, micro-batches of at most
+  `rollout.train_token_budget` real tokens (remove-padding layout), each compacted to its columns.
+  Per mini-batch one gloo all-reduce gives the global token / sequence counts of `response_mask`
+  and `response_mask * format_mask`; `global_loss_denominator(fixed=...)` then makes the sum of all
+  micro-batch losses on all ranks the exact global mini-batch token-mean (no collective inside the
+  micro-batch loop). The PPO ratio uses the scoring-time student top-k log-probs (clip 0.2/0.28 act
+  on updates 2..K) and the M4 reward refresh runs on every update. `actor/grad_norm` is the owner's
+  global norm; `actor/grad_norm_local` the root-sum-square of this rank's micro-batch norms.
+* **top_p_intersec**: every teacher returns its nucleus mask over the student top-k ids; the driver
+  keeps the routed teacher's mask per sample (`mt_opd.select_routed_teacher_masks`). The MT-OPD
+  reward uses the released `intersection` formula on that mask (the released MT-OPD reward has no
+  `top_p_intersec` branch; the released Direct-OPD/ExOPD rewards treat it the same way), and the
+  refresh applies the same fixed mask (`refresh_opd_advantage(valid_mask=...)`).
+* **Per-domain response limit**: `+data.response_length_domains=[...] +data.response_length_values=[...]`
+  set a per-prompt vLLM `max_tokens` during training (validation keeps one limit); responses are
+  still padded to `data.max_response_length`.
+* **GPU budget while vLLM sleeps**: `gpu_memory_limit_gb` caps PyTorch's allocator, and vLLM's sleep
+  allocator unmaps the KV cache's pages but leaves its blocks counted by PyTorch, so training got
+  ~10 GiB less than the budget (the first full-size trial OOMed on a 24,576-token micro-batch with
+  12.4 GiB physically in use). In large-batch mode `update_actor` runs inside
+  `memory_utils.unbacked_memory_allowance()`, which raises the cap by `memory_reserved - device used`
+  (a lower bound on the unbacked bytes, so backed memory stays within the budget) and restores it on
+  exit; the cached blocks are returned before vLLM wakes (`OPENMOPD_RELEASE_CACHE=1`, set by the
+  recipe). Metrics: `memory/update_kv_allowance_gib`, `memory/update_backed_gib_max`.
+* **Driver host memory** (`ray_trainer._release_step_data`): at batch 1024 x 16K x top-16 every
+  [rows, T, K] tensor is 1 GiB. The driver holds the batch (~10 GB), the scoring output (~6 GB,
+  including keys already popped from the batch) and ~16 metric temporaries of the top-k analysis
+  (`student_p`, `adv_for_max`, ...), all bound to fit() locals that are rebound only partway into the
+  next step, so two steps' data coexisted (driver RSS 38 GB at the start of step 2 vs 8 GB at step 1;
+  host MemAvailable down to 13.5 GiB of 251). In large-batch mode, right before the update_actor
+  dispatch everything the rest of the step does not read is freed (DataProtos other than `batch`,
+  [rows, ...] tensors >= 64 MiB not sharing storage with `batch`), and at the end of the step all of it.
+  The top-k diagnostics at the end of `adv` (`val-topk/*`, `val-extrema/*`, logged every step) read
+  every 4th row in large-batch mode (`OPENMOPD_TOPK_ANALYSIS_ROWS=256` rows, `0` = all rows;
+  `mt_opd/topk_analysis_rows` records it): their temporaries were the step's host peak (+16 GB on the
+  driver, ~224-227 GiB of 251 in use in the full-size trial). They are diagnostics only; the loss,
+  rewards and advantages use every row.
+  `OPENMOPD_PHASE_LOG=1` prints phase boundaries with driver RSS / MemAvailable and the locals still
+  holding >= 64 MiB.
+
+Launcher: `scripts/cpu_dp/open_mopd_recipe.sh` (all Table-8 settings; TensorBoard under
+`/mnt/sda1/xxf/tensorboard/<run>`, checkpoints under `/mnt/sda1/xxf/ckpt/<run>`, log tee'd to
+`/mnt/sda1/xxf/cpu_dp_logs/<run>.log`).
+
+```bash
+python training/verl/tests/cpu_dp/test_dp_accumulate.py --gpus 0,1,2,3  # test 1: accumulation x updates vs FP32 reference
+python training/verl/tests/cpu_dp/test_large_batch_loss.py              # test 2: global loss over micro-batches x ranks (CPU)
+python training/verl/tests/cpu_dp/test_top_p_intersec.py                # test 3: nucleus mask, routing, reward, refresh (CPU)
+```
+
+Fast checks before a full-size run (~15-20 min each, so a failure shows up before an hour-long
+rollout does):
+
+```bash
+# full-batch host memory, dispatch and checkpoint: batch 1024 at the full padded width, generation capped at 512 tokens
+DOMAIN_MAX_TOKENS=512,512,512 OPENMOPD_NUM_STEPS=2 SAVE_FREQ=2 TEST_FREQ=-1 RESUME_MODE=disable OPENMOPD_PHASE_LOG=1 \
+  RUN_NAME=lb_hostmem bash scripts/cpu_dp/open_mopd_recipe.sh
+# GPU memory at the full training token budget (24,576-token micro-batches): batch 128, 8K responses
+OPENMOPD_TRAIN_BATCH_SIZE=128 MINI_BATCH_SIZE=64 MAX_RESPONSE_LENGTH=8192 OPENMOPD_NUM_STEPS=2 SAVE_FREQ=-1 TEST_FREQ=-1 \
+  RESUME_MODE=disable RUN_NAME=lb_memfix bash scripts/cpu_dp/open_mopd_recipe.sh
+```
+
+Test results (G4090j, 2026-11-23; logs in `/mnt/sda1/xxf/cpu_dp_logs/large_batch/`):
+
+| test | result |
+|---|---|
+| 1 accumulation x updates (4 GPUs, 3 micro-batches x 4 updates, ring of 2, NaN in one micro-batch of one rank) | masters vs a one-step reference built from the exact BF16 micro-batch grads the pipeline received (FP32 rank-order sum, FP64 norm, clip, AdamW from the pipeline's previous state): max abs error 1.2e-7; replicas bitwise identical every update; the NaN update is skipped on every rank. (The end-to-end trajectory vs a plain non-FSDP model drifts on single elements after a few updates: BF16 kernel differences, amplified by Adam on near-zero gradients; informational.) |
+| 2 loss over micro-batches x ranks (4 gloo ranks, ragged/empty responses, format mask, top-p-masked 3D advantages) | loss and gradient equal to the single-batch `compute_policy_loss_vanilla` exactly (max abs grad error 0) for token-mean, seq-mean-token-sum, seq-mean-token-mean |
+| 3 top_p_intersec | row-blocked teacher nucleus mask == released implementation bit for bit (and == an FP64 exclusive-cumsum nucleus); routed mask/log-probs == the domain teacher's; MT-OPD reward == per-sample intersection formula on the routed teacher (float rounding only); refresh with the mask == reward x response_mask exactly |
+| 4 scoring loop, N micro-batches vs 1 cycle (in-run, `OPENMOPD_SCORING_CHECK=1`, 7-8 cycles per rank) | widths/shapes identical; sampled-token log-prob mean abs diff 0.017-0.019 (max 0.49), entropy 0.013; student top-16 ids 82% positionally equal (near-tie order swaps); teacher log-probs on matching ids mean abs 0.075; nucleus masks 99.3-99.4% equal. These are BF16 batch-shape differences (different packed lengths change the GEMM shapes), not layout errors (a misalignment would give ~0% id agreement). |
+| 7 checkpoint save + resume (batch 32, mini-batch 8, save at step 2, resume, train-token budget 2048 to force several micro-batches) | owner optimizer restored (version 8, seq 8, Adam steps 8, lr); replicas identical after the resumed updates; published version 12; resumed step 3 drew the same prompts as the original step 3 (`DomainWeightedSampler` resumes its position inside the epoch through StatefulDataLoader. It has no `state_dict`, so its epoch counter, which seeds each epoch's order, is not saved: a resume in epoch 2 or 3 would presumably reuse epoch 1's order; not tested across an epoch boundary). Save: ~200 s for 60 GB; load: ~5 min (mmap). |
+| GPU budget fix (`lb_memfix`: batch 128, mini-batch 64, 8K responses, train budget 24,576, 2 steps) | passes. PyTorch-counted update peak 24.4 GiB, above the old 22.53 GiB cap (the unpatched code OOMs here); backed peak <= 15.2 GiB; slept-KV allowance 8.8-9.3 GiB; nvidia-smi peak 20.5 GiB of 23.5; replicas identical; 5.0-5.2 min per step |
+| full-batch host memory (`lb_hostmem*`: batch 1024, padded width 16384, generation capped at 512 tokens, 2-3 steps) | before the release: driver RSS 8 GB at step 1 vs 38 GB at step 2, MemAvailable down to 13.5-21 GiB. With the end-of-step release only: every step starts at 16 GB, MemAvailable 17.7 GiB during the dispatch. With the pre-dispatch release as well (`lb_hostmem4`): driver 22.6 GB at the dispatch, lowest MemAvailable 30-31 GiB (~220 GiB in use; the remaining peak is the top-k metric analysis at the end of `adv`); replicas identical, 4 updates per step. Full-size checkpoint save: 3.7-3.9 min, no host peak |
+| 5 long sequence + gradient checkpointing | covered by test 8: 16K-token responses train on the 24 GB cards (GPU0/1) with 24,576-token micro-batches, nvidia-smi peak 21.1 GiB |
+| 6 equivalence vs single GPU with accumulation | not run: large-batch accumulation is implemented for cpu_dp only (the single-GPU path has no accumulation mode to compare against) |
+| 8 full-size trial (`lb_trial2`: the exact recipe, validation first, 2 steps, no checkpoint; profile in `/mnt/sda1/xxf/cpu_dp_logs/profile_report.md`) | passes. Validation 6.7 min; step 80.4 / 81.9 min = rollout 48.7-49.7 (slowest vs fastest rank 3.7-4.6 min apart) + scoring 17.6-17.9 + reward/adv 1.5 + update_actor 12.7-12.8 (4 updates, ~37.6 micro-batches per rank per update, CPU update 2.5 s). Math/code responses mean 11.7-11.8K tokens (28% at 16,384), IF 0.4K. Replicas identical, no skipped update, versions in step (policy lag 0). GPU: nvidia-smi peak 21.1 GiB (GPU0), update backed <= 15.8 GiB. Host: peak 225.9 GiB in use (sampler) / 228.5 GiB (0.5 s telemetry) of 251 at the end of `adv`, the plan's ~225 abort line -> top-k diagnostics sampled (next row). /dev/shm 131.8 GiB. 200 steps ~11.4 days incl. 10 validations + 20 checkpoints |
+| top-k diagnostics on 256 sampled rows (`lb_topk`: as `lb_hostmem`, 2 steps, no checkpoint; compare `lb_hostmem4`) | driver at the end of `adv` 36.0 GB vs 46.1-46.3; host telemetry peak 211-212 GiB vs 219-221 (sampler: lowest MemAvailable 38 vs 30-31 GiB); `adv` 7-9 s vs 19-23 s; the sampled metrics match the full-batch ones within step-to-step noise (overlap 0.322 / 0.296 vs 0.315 / 0.306, student p-sum 0.969 / 0.979 vs 0.971 / 0.976); replicas identical. Expected full-recipe host peak ~219 GiB (from 228.5) |
+
 ## Results on G4090j (4x RTX 4090, all treated as 24 GiB; 2026-11-22)
 
 Same r2.sh workload, 30 steps each, validation off, steps 2..30 averaged

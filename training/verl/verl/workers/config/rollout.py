@@ -221,6 +221,16 @@ class RolloutConfig(BaseConfig):
     cpu_dp_node_threads: Optional[int] = None
     cpu_optimizer_threads: int = 8
     pipeline_gradient_offload: bool = True
+    # Large-batch mode (requires cpu_adam_async=false): several scoring micro-batches
+    # per step, several training micro-batches per mini-batch (gradients accumulated
+    # in FP32 on the host) and one synchronous optimizer update per mini-batch.
+    large_batch: bool = False
+    # Scoring micro-batch budget in padded positions (n_seqs x longest compacted sequence).
+    scoring_token_budget: int = 24576
+    # Training micro-batch budget in real (prompt+response) tokens.
+    train_token_budget: int = 24576
+    # Pinned landing slots for gradient D2H (each = largest FSDP flat parameter).
+    accum_ring_slots: int = 4
 
     # Single-GPU process budget; reserves 1 GiB outside the PyTorch allocator.
     # vLLM utilization is computed against this capacity instead of the full GPU.
@@ -287,7 +297,10 @@ def validate_cpu_adam_config(config):
         raise ValueError("CPUAdamPipeline requires share_weights=true")
     if not slots and async_update is not False:
         raise ValueError("independent CPUAdam requires cpu_adam_async=false")
-    if config.get("top_k_strategy", "only_stu") != "only_stu":
-        raise ValueError("CPUAdamPipeline requires OPD top_k_strategy=only_stu")
+    strategies = ("only_stu", "top_p_intersec") if config.get("large_batch", False) else ("only_stu",)
+    if config.get("top_k_strategy", "only_stu") not in strategies:
+        raise ValueError(f"CPUAdamPipeline requires OPD top_k_strategy in {strategies}")
+    if config.get("large_batch", False) and async_update is not False:
+        raise ValueError("large_batch requires cpu_adam_async=false (synchronous updates)")
     if config.get("cpu_optimizer_threads", 8) < 1:
         raise ValueError("cpu_optimizer_threads must be positive")

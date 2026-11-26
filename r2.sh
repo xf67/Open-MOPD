@@ -109,6 +109,10 @@ if [[ "${num_gpus}" =~ ^[0-9]+$ ]] && ((num_gpus > 1)); then cpu_dp_default=true
 CPU_DP="${CPU_DP:-${cpu_dp_default}}"
 CPU_DP_OWNER_RANK="${CPU_DP_OWNER_RANK:-0}"
 CPU_DP_NODE_THREADS="${CPU_DP_NODE_THREADS:-null}"
+# Large-batch cpu_dp mode: several scoring micro-batches, FP32 host gradient accumulation and
+# one synchronous update per mini-batch (requires CPU_ADAM_ASYNC=false).
+LARGE_BATCH="${LARGE_BATCH:-false}"
+LOG_PROB_TOP_K="${LOG_PROB_TOP_K:-256}"
 # Keep rollout chunks fixed; merge actual prompt+response tokens before scoring/training.
 # Token batching is single-GPU only.
 token_batching_default=false
@@ -131,7 +135,7 @@ for var in USE_CU13 SHARE_STUDENT_WEIGHTS BF16_STUDENT_WEIGHTS OPTIMIZER_OFFLOAD
   TEACHER_LAYER_PIPELINE PIPELINE_GRADIENT_OFFLOAD STEP_MEMORY_ENABLED val_before_train \
   CPU_ADAM_ENABLED PIPELINE_FP32_GRADIENTS TEACHER_PARAM_OFFLOAD \
   VERIFY_WEIGHT_SYNC SKIP_INITIAL_WEIGHT_SYNC ENFORCE_EAGER ENABLE_CHUNKED_PREFILL \
-  ENABLE_PREFIX_CACHING FREE_CACHE_ENGINE TOKEN_BATCHING_ENABLED CPU_DP; do
+  ENABLE_PREFIX_CACHING FREE_CACHE_ENGINE TOKEN_BATCHING_ENABLED CPU_DP LARGE_BATCH; do
   [[ "${!var}" == true || "${!var}" == false ]] || die "${var} must be true or false"
 done
 [[ "${CPU_ADAM_ASYNC}" == true || "${CPU_ADAM_ASYNC}" == false || "${CPU_ADAM_ASYNC}" == null ]] || \
@@ -149,7 +153,7 @@ esac
 for var in num_gpus train_batch_size TEACHER_LAYER_PIPELINE_MAX_MB \
   TEACHER_PARAM_PREFETCH_MAX_MB CUDA_DEVICE_MAX_CONNECTIONS CPU_OPTIMIZER_THREADS \
   gpu_memory_limit_gb kv_cache_mb max_num_seqs val_batch_size val_reward_workers \
-  TOKEN_BATCHING_MIN_TOKENS TOKEN_BATCHING_MAX_BATCH_SIZE; do
+  TOKEN_BATCHING_MIN_TOKENS TOKEN_BATCHING_MAX_BATCH_SIZE LOG_PROB_TOP_K; do
   [[ "${!var}" =~ ^[1-9][0-9]*$ ]] || die "${var} must be a positive integer"
 done
 ((gpu_memory_limit_gb > 1 && kv_cache_mb < (gpu_memory_limit_gb - 1) * 1024)) || \
@@ -171,7 +175,9 @@ done
 if ((max_num_seqs > 1)); then cudagraph_sizes_csv+=",${max_num_seqs}"; fi
 ((train_batch_size % num_gpus == 0)) || die "Train batch size must be divisible by GPU count"
 # A single-GPU token batch is one intact pipeline batch, so its rollout chunk may hold several prompts.
-if [[ "${TEACHER_FORWARD_OVERLAP}" == true && "${TOKEN_BATCHING_ENABLED}" != true ]] && ((train_batch_size != num_gpus)); then
+if [[ "${LARGE_BATCH}" == true ]]; then
+  [[ "${CPU_ADAM_ASYNC}" == false ]] || die "LARGE_BATCH=true requires CPU_ADAM_ASYNC=false"
+elif [[ "${TEACHER_FORWARD_OVERLAP}" == true && "${TOKEN_BATCHING_ENABLED}" != true ]] && ((train_batch_size != num_gpus)); then
   die "Teacher forward overlap requires one sequence per GPU (batch size = GPU count); set TEACHER_FORWARD_OVERLAP=false"
 fi
 
@@ -243,6 +249,7 @@ cmd=("${python_bin}" -m verl.trainer.main_ppo
   actor_rollout_ref.rollout.cpu_dp="${CPU_DP}"
   actor_rollout_ref.rollout.cpu_dp_owner_rank="${CPU_DP_OWNER_RANK}"
   actor_rollout_ref.rollout.cpu_dp_node_threads="${CPU_DP_NODE_THREADS}"
+  actor_rollout_ref.rollout.large_batch="${LARGE_BATCH}"
   actor_rollout_ref.rollout.teacher_layer_pipeline="${TEACHER_LAYER_PIPELINE}"
   actor_rollout_ref.rollout.teacher_layer_pipeline_max_mb="${TEACHER_LAYER_PIPELINE_MAX_MB}"
   +actor_rollout_ref.rollout.reward_mode=mt_opd
@@ -254,7 +261,7 @@ cmd=("${python_bin}" -m verl.trainer.main_ppo
   actor_rollout_ref.actor.optim.override_optimizer_config='{foreach:false}'
   actor_rollout_ref.rollout.tensor_model_parallel_size=1
   actor_rollout_ref.rollout.log_prob_micro_batch_size_per_gpu=1
-  +actor_rollout_ref.rollout.log_prob_top_k=256
+  +actor_rollout_ref.rollout.log_prob_top_k="${LOG_PROB_TOP_K}"
   +actor_rollout_ref.rollout.top_k_strategy="${TOP_K_STRATEGY}"
   +actor_rollout_ref.rollout.reward_weight_mode="${REWARD_WEIGHT_MODE}"
   +actor_rollout_ref.rollout.teacher_temperature="${TEACHER_TEMPERATURE}"

@@ -133,15 +133,27 @@ def _compute_student_topk_in_teacher_top_p_mask(
     if not 0 < float(top_p) <= 1:
         raise ValueError(f"top_p must be in (0, 1], got {top_p}")
 
-    probs = torch.softmax(logits, dim=-1)
-    sorted_probs, sorted_ids = torch.sort(probs, dim=-1, descending=True)
-    cumulative_probs = sorted_probs.cumsum(dim=-1)
-    sorted_mask = cumulative_probs <= float(top_p)
-    sorted_mask[..., 0] = True
-    sorted_mask[..., 1:] |= sorted_mask[..., :-1].clone()
-    full_mask = torch.zeros_like(sorted_mask, dtype=torch.bool)
-    full_mask.scatter_(dim=-1, index=sorted_ids, src=sorted_mask)
-    return torch.gather(full_mask, dim=-1, index=student_ids).float()
+    # Rows are independent: process them in blocks so the full-vocabulary sort, cumsum and
+    # masks do not each hold [rows, vocab] at once (identical results, ~1/8 the peak).
+    rows = int(os.environ.get("OPENMOPD_TOP_P_MASK_ROWS", "256"))
+    parts = []
+    for start in range(0, logits.shape[0], max(rows, 1)):
+        block = logits[start:start + max(rows, 1)]
+        probs = torch.softmax(block, dim=-1)
+        sorted_probs, sorted_ids = torch.sort(probs, dim=-1, descending=True)
+        del probs
+        cumulative_probs = sorted_probs.cumsum(dim=-1)
+        del sorted_probs
+        sorted_mask = cumulative_probs <= float(top_p)
+        del cumulative_probs
+        sorted_mask[..., 0] = True
+        sorted_mask[..., 1:] |= sorted_mask[..., :-1].clone()
+        full_mask = torch.zeros_like(sorted_mask, dtype=torch.bool)
+        full_mask.scatter_(dim=-1, index=sorted_ids, src=sorted_mask)
+        parts.append(torch.gather(full_mask, dim=-1, index=student_ids[start:start + max(rows, 1)]).float())
+    if not parts:
+        return torch.zeros_like(student_ids, dtype=torch.float32)
+    return torch.cat(parts, dim=0)
 
 
 def create_device_mesh(world_size, fsdp_size):
@@ -442,6 +454,10 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
 
     def _synchronous_cpu_adam(self):
         return self._uses_cpu_adam() and self.config.rollout.get("cpu_adam_async") is False
+
+    def _large_batch(self):
+        """Several scoring micro-batches, accumulation micro-batches and synchronous updates per step."""
+        return bool(self.config.rollout.get("large_batch", False)) and self._synchronous_cpu_adam()
 
     def _assert_published_policy(self, data=None):
         optimizer = self.actor_optimizer
@@ -819,8 +835,12 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
                         fp32_gradients=fp32_gradients,
                         owner_rank=self.config.rollout.get("cpu_dp_owner_rank", 0),
                         node_threads=self.config.rollout.get("cpu_dp_node_threads", None),
+                        accumulate=self._large_batch(),
+                        ring_slots=self.config.rollout.get("accum_ring_slots", 4),
                     )
                 else:
+                    if self._large_batch():
+                        raise ValueError("rollout.large_batch currently requires rollout.cpu_dp (SharedCPUAdamPipeline)")
                     actor_optimizer = CPUAdamPipeline(
                     actor_optimizer, actor_module_fsdp,
                     overlap=self.config.rollout.pipeline_overlap,
@@ -1344,6 +1364,13 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
             if "rollout_policy_version" not in data.meta_info or "scoring_policy_version" not in data.meta_info:
                 raise RuntimeError("synchronous OPD requires rollout and scoring version evidence")
             data.meta_info.update(opd_pipeline=True, learner_policy_version=sync_version)
+        expected_updates = 1
+        if self._large_batch():
+            mini = self.config.actor.ppo_mini_batch_size
+            if len(data) % mini != 0:
+                raise ValueError(f"large_batch: rank batch {len(data)} is not a multiple of mini-batch {mini}")
+            expected_updates = len(data) // mini * self.config.actor.ppo_epochs
+            data.meta_info["train_token_budget"] = self.config.rollout.get("train_token_budget", 24576)
         replica_checksum = None
         check_every = int(os.environ.get("OPENMOPD_CPU_DP_CHECK_EVERY", "0"))
         if self._cpu_dp and check_every > 0:
@@ -1367,7 +1394,18 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
 
             # perform training
             with Timer(name="update_policy", logger=None) as timer:
-                metrics = self.actor.update_policy(data=data)
+                if self._large_batch():
+                    # vLLM is asleep: let training use the slept KV cache's share of the GPU budget.
+                    from verl.utils.memory_utils import unbacked_memory_allowance
+
+                    get_torch_device().reset_peak_memory_stats()
+                    with unbacked_memory_allowance() as unbacked:
+                        metrics = self.actor.update_policy(data=data)
+                    peak = get_torch_device().max_memory_allocated()
+                    metrics["memory/update_kv_allowance_gib"] = unbacked / 1024**3
+                    metrics["memory/update_backed_gib_max"] = (peak - unbacked) / 1024**3  # upper bound
+                else:
+                    metrics = self.actor.update_policy(data=data)
             if replica_checksum is not None:
                 metrics["cpu_dp/replicas_identical"] = 1.0
                 metrics["cpu_dp/replica_checksum_mod1e6"] = float(replica_checksum % 1000003)
@@ -1379,8 +1417,11 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
                 metrics["pipeline/learner_version"] = self.actor_optimizer.version
             if sync_version is not None:
                 published = self._assert_published_policy()
-                if published != sync_version + 1:
-                    raise RuntimeError("synchronous CPUAdam did not publish exactly one optimizer update")
+                if published != sync_version + expected_updates:
+                    raise RuntimeError(
+                        f"synchronous CPUAdam published {published - sync_version} updates, expected {expected_updates}"
+                    )
+                metrics["pipeline/updates_per_step"] = float(published - sync_version)
                 metrics.update({
                     "pipeline/rollout_version": data.meta_info["rollout_policy_version"],
                     "pipeline/scoring_version": data.meta_info["scoring_policy_version"],
@@ -1578,6 +1619,12 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
         """Overlap student/primary forwards, then score colocated MT teachers before returning."""
         if not self.config.rollout.get("teacher_forward_overlap", False):
             raise ValueError("joint scoring requires teacher_forward_overlap=true")
+        if data.meta_info.get("reward_mode") != "mt_opd" or data.meta_info.get("log_prob_top_k", 0) <= 0:
+            raise ValueError("teacher forward overlap currently requires MT-OPD with student top-k")
+        if data.meta_info.get("is_lora", False):
+            raise ValueError("teacher forward overlap does not support reference/adapter-disabled scoring")
+        if self._large_batch():
+            return self._score_large_batch(data)
         token_batch = data.meta_info.get("pipeline_token_batch", False)
         if token_batch and not self.config.rollout.get("student_teacher_pipeline", False):
             raise ValueError("token batching requires the student/teacher pipeline")
@@ -1589,13 +1636,14 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
             or self.config.rollout.log_prob_use_dynamic_bsz
         ):
             raise ValueError("teacher forward overlap requires exactly one fixed student micro-batch")
-        if data.meta_info.get("reward_mode") != "mt_opd" or data.meta_info.get("log_prob_top_k", 0) <= 0:
-            raise ValueError("teacher forward overlap currently requires MT-OPD with student top-k")
-        if data.meta_info.get("is_lora", False):
-            raise ValueError("teacher forward overlap does not support reference/adapter-disabled scoring")
         teacher = self.get_fused_worker_by_name("rm")
         if not token_batch and len(data) > (teacher.config.micro_batch_size_per_gpu or 0):
             raise ValueError("teacher forward overlap requires exactly one fixed teacher micro-batch")
+        return self._score_cycle(data)
+
+    def _score_cycle(self, data: DataProto, extra_overlap_masks=False):
+        """One S -> T0 -> T1 -> T2 -> S slot-pipeline cycle over one scoring micro-batch."""
+        teacher = self.get_fused_worker_by_name("rm")
         runner = teacher.prepare_forward_overlap()
         # Deserialized TensorDicts may retain consolidated-storage metadata.
         # Adding student tensors then calling .to() can reinterpret those tensors
@@ -1656,11 +1704,15 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
                     extra_teacher = self.get_fused_worker_by_name(role)
                     extra_output = extra_teacher._compute_rm_score(scoring_data)
                     index = int(role.removeprefix("mt_rm_"))
-                    # MT-OPD consumes only this field from additional teachers.
+                    # MT-OPD consumes only this field from additional teachers (plus, for
+                    # top_p_intersec, each teacher's own nucleus mask, routed per sample later).
                     # Reuse the GPU input/top-k tensors instead of a Ray round trip.
-                    output.union(DataProto.from_dict(tensors={
+                    extra_tensors = {
                         f"mt_teacher_{index}_on_student_log_probs": extra_output.batch["teacher_on_student_log_probs"],
-                    }))
+                    }
+                    if extra_overlap_masks and "overlap_mask" in extra_output.batch.keys():
+                        extra_tensors[f"mt_teacher_{index}_overlap_mask"] = extra_output.batch["overlap_mask"]
+                    output.union(DataProto.from_dict(tensors=extra_tensors))
                     del extra_output
                 if cpu_pipeline:
                     pipeline.finish_cycle()
@@ -1679,6 +1731,130 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
                 except BaseException:
                     logger.exception("Failed to drain teacher stream after joint scoring failure")
                 raise
+
+    # Scoring outputs consumed by large-batch MT-OPD (only_stu / top_p_intersec); everything
+    # else (teacher top-k ids/log-probs, T-in-S masks, counts) is dropped before returning.
+    _LARGE_BATCH_SCORING_KEYS = {
+        "old_log_probs": 0.0, "entropys": 0.0, "student_top_k_ids": 0, "student_top_k_log_probs": 0.0,
+        "teacher_on_student_log_probs": 0.0, "teacher_entropy": 0.0, "overlap_mask": False,
+    }
+
+    def _score_large_batch(self, data: DataProto):
+        """Large-batch scoring: one slot-pipeline cycle per padded-token-budget micro-batch.
+
+        Micro-batches are contiguous rows (balance_batch orders each rank's partition by
+        length, so neighbours are similar) whose count x (longest prompt + longest response)
+        fits ``rollout.scoring_token_budget``; each is compacted to its own columns, scored,
+        moved to host and re-padded to the rank batch's response width.
+        """
+        from verl.utils.large_batch import compact_columns, repad_responses, split_by_budget, valid_lengths
+
+        if not self.config.rollout.get("student_teacher_pipeline", False):
+            raise ValueError("large_batch scoring requires the student/teacher pipeline")
+        if data.meta_info.get("rollout_policy_version") != self.actor_optimizer.version:
+            raise ValueError("large_batch rollout no longer matches the scoring policy version")
+        strategy = data.meta_info.get("top_k_strategy", "only_stu")
+        if strategy not in ("only_stu", "top_p_intersec"):
+            raise ValueError(f"large_batch scoring supports only_stu and top_p_intersec, got {strategy}")
+        top_p = strategy == "top_p_intersec"
+        budget = int(self.config.rollout.get("scoring_token_budget", 24576))
+        response_width = data.batch["responses"].shape[1]
+        prompt_lengths, response_lengths = valid_lengths(data.batch["attention_mask"], response_width)
+        groups = split_by_budget(prompt_lengths, response_lengths, budget, padded=True)
+        keys = dict(self._LARGE_BATCH_SCORING_KEYS)
+        n_extra = sum(1 for name in self.fused_worker_dict if name.startswith("mt_rm_"))
+        for index in range(1, n_extra + 1):
+            keys[f"mt_teacher_{index}_on_student_log_probs"] = 0.0
+            if top_p:
+                keys[f"mt_teacher_{index}_overlap_mask"] = False
+        if not top_p:
+            keys.pop("overlap_mask")
+        tensor_keys = ["input_ids", "attention_mask", "position_ids", "responses", "response_mask"]
+        parts = {key: [] for key in keys}
+        version = self.actor_optimizer.version
+        timing = {"cycles": 0, "padded_positions": 0, "real_tokens": 0}
+        for rows in groups:
+            first, last = rows[0], rows[-1] + 1
+            keep_prompt = max(prompt_lengths[r] for r in rows)
+            keep_response = max(response_lengths[r] for r in rows)
+            tensors = {key: data.batch[key][first:last] for key in tensor_keys if key in data.batch.keys()}
+            tensors = compact_columns(tensors, response_width, keep_prompt, keep_response)
+            meta = dict(data.meta_info)
+            # One intact micro-batch per call: every scorer uses len(data) as its micro-batch.
+            meta["pipeline_token_batch"] = True
+            sub = DataProto.from_dict(
+                tensors=tensors,
+                non_tensors={k: v[first:last] for k, v in data.non_tensor_batch.items()},
+                meta_info=meta,
+            )
+            output = self._score_cycle(sub, extra_overlap_masks=top_p)
+            for key, pad in keys.items():
+                if key not in output.batch.keys():
+                    raise RuntimeError(f"large_batch scoring output lacks {key}")
+                value = output.batch[key]
+                if key == "student_top_k_ids":
+                    value = value.to(torch.int32)  # vocab < 2^31; restored to int64 per training micro-batch
+                elif key.endswith("overlap_mask"):
+                    value = value.bool()
+                parts[key].append(repad_responses(value.to("cpu", non_blocking=False), response_width, pad))
+            del output
+            timing["cycles"] += 1
+            timing["padded_positions"] += len(rows) * (keep_prompt + keep_response)
+            timing["real_tokens"] += sum(prompt_lengths[r] + response_lengths[r] for r in rows)
+        if self.actor_optimizer.version != version:
+            raise RuntimeError("large_batch scoring changed the policy version")
+        check_metrics = {}
+        if os.environ.get("OPENMOPD_SCORING_CHECK", "0") == "1" and len(groups) > 1:
+            # Test 4: the same rank batch scored in ONE cycle (compacted to the batch maxima)
+            # must agree with the micro-batch loop within BF16 tolerance; widths must match.
+            keep_prompt, keep_response = max(prompt_lengths), max(response_lengths)
+            tensors = {key: data.batch[key] for key in tensor_keys if key in data.batch.keys()}
+            tensors = compact_columns(tensors, response_width, keep_prompt, keep_response)
+            meta = dict(data.meta_info)
+            meta["pipeline_token_batch"] = True
+            whole = self._score_cycle(
+                DataProto.from_dict(tensors=tensors, non_tensors=dict(data.non_tensor_batch), meta_info=meta),
+                extra_overlap_masks=top_p,
+            )
+            mask = data.batch["response_mask"].bool()
+            # Top-k slots are compared only where both runs chose the same student id at the
+            # same position (near-ties swap order under BF16 batch-shape differences).
+            same_ids = (torch.cat(parts["student_top_k_ids"], dim=0).long() == repad_responses(
+                whole.batch["student_top_k_ids"].to("cpu"), response_width, 0).long())
+            for key in keys:
+                got = torch.cat(parts[key], dim=0)
+                want = repad_responses(whole.batch[key].to("cpu"), response_width, keys[key])
+                if got.shape[:2] != want.shape[:2] or got.shape[1] != response_width:
+                    raise RuntimeError(f"scoring check: {key} shape {tuple(got.shape)} vs {tuple(want.shape)}")
+                valid = mask if got.dim() == 2 else mask.unsqueeze(-1).expand_as(got)
+                if got.dim() == 3 and key != "student_top_k_ids":
+                    valid = valid & same_ids
+                if got.dtype.is_floating_point:
+                    diff = (got.float() - want.float()).abs()[valid]
+                    check_metrics[f"scoring_check/{key}/max_abs"] = float(diff.max()) if diff.numel() else 0.0
+                    check_metrics[f"scoring_check/{key}/mean_abs"] = float(diff.mean()) if diff.numel() else 0.0
+                else:
+                    same = (got.long() == want.long())[valid].float()
+                    check_metrics[f"scoring_check/{key}/match_frac"] = float(same.mean()) if same.numel() else 1.0
+            del whole
+            print(f"[scoring check] {len(groups)} micro-batches vs 1 cycle: {check_metrics}", flush=True)
+        result = DataProto.from_dict(
+            tensors={key: torch.cat(values, dim=0) for key, values in parts.items()},
+            meta_info={
+                "temperature": self.config.rollout.temperature,
+                "opd_pipeline": True,
+                "scoring_policy_version": version,
+                "learner_policy_version": version,
+                # Per-rank values: DataProto.concat collects "metrics" into lists (the driver pops them).
+                "metrics": {
+                    "scoring/cycles": float(timing["cycles"]),
+                    "scoring/padded_positions": float(timing["padded_positions"]),
+                    "scoring/real_tokens": float(timing["real_tokens"]),
+                    **check_metrics,
+                },
+            },
+        )
+        return result
 
     @register(dispatch_mode=make_nd_compute_dataproto_dispatch_fn(mesh_name="actor"))
     @DistProfiler.annotate(color="blue", role="actor_compute_log_probs_for_ids")

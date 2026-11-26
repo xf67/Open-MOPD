@@ -669,6 +669,8 @@ class vLLMRollout(BaseRollout):
         batch_size = idx.size(0)
 
         non_tensor_batch = prompts.non_tensor_batch
+        # Per-prompt training response limit (e.g. per domain); padding stays response_length.
+        per_prompt_max_tokens = non_tensor_batch.pop("rollout_max_tokens", None)
         if "raw_prompt_ids" not in non_tensor_batch:
             non_tensor_batch["raw_prompt_ids"] = np.array(
                 [_pre_process_inputs(self.pad_token_id, idx[i]) for i in range(batch_size)], dtype=object
@@ -749,9 +751,21 @@ class vLLMRollout(BaseRollout):
         with self.update_sampling_params(**kwargs):
             if callback := getattr(self, "pipeline_start_optimizer", None):
                 callback()
+            sampling_params = self.sampling_params
+            if per_prompt_max_tokens is not None and do_sample and not is_validate:
+                if len(per_prompt_max_tokens) != len(vllm_inputs):
+                    raise RuntimeError("rollout_max_tokens must have one entry per prompt")
+                sampling_params = []
+                for limit in per_prompt_max_tokens:
+                    limit = int(limit)
+                    if not 0 < limit <= self.config.response_length:
+                        raise ValueError(f"per-prompt max_tokens {limit} outside (0, {self.config.response_length}]")
+                    params = self.sampling_params.clone()
+                    params.max_tokens = limit
+                    sampling_params.append(params)
             outputs = self.inference_engine.generate(
                 prompts=vllm_inputs,  # because we have already convert it to prompt token id
-                sampling_params=self.sampling_params,
+                sampling_params=sampling_params,
                 lora_request=lora_requests,
                 use_tqdm=False,
             )

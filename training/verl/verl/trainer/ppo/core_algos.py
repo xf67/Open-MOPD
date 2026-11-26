@@ -21,6 +21,7 @@ implement PPO-like algorithms.
 __all__ = ["register_adv_est", "get_adv_estimator_fn", "AdvantageEstimator"]
 
 from collections import defaultdict
+from contextlib import contextmanager
 from enum import Enum
 from typing import Any, Callable, Optional
 
@@ -1044,17 +1045,30 @@ class global_loss_denominator:
     Inside this context, ``agg_loss`` returns this rank's share of the global
     objective: sum(local numerator) / sum_over_ranks(denominator). Summing the
     ranks' gradients (verl.utils.dp_cpu_adam) then yields exactly the gradient of
-    the global-batch token-mean (or sequence-mean) loss. ``reduce`` maps a local
-    scalar denominator tensor to the global one (a gloo all-reduce). Every rank
-    must make the same sequence of agg_loss calls (one fixed micro-batch per step).
+    the global-batch token-mean (or sequence-mean) loss.
+
+    Two modes:
+
+    * ``reduce``: maps a local scalar denominator tensor to the global one (a gloo
+      all-reduce). Every rank must make the same sequence of agg_loss calls (one
+      fixed micro-batch per step).
+    * ``fixed``: precomputed global counts for a whole mini-batch (all ranks and all
+      micro-batches), ``{kind: {"tokens": float, "seqs": float}}``. Summing the
+      micro-batch gradients then yields the gradient of the mini-batch mean, with no
+      collective inside the micro-batch loop. The mask kind used by the next
+      ``agg_loss`` call is chosen with ``select(kind)`` (default ``"response"``).
     """
 
-    def __init__(self, reduce):
+    def __init__(self, reduce=None, fixed=None):
+        if (reduce is None) == (fixed is None):
+            raise ValueError("global_loss_denominator needs exactly one of reduce or fixed")
         self.reduce = reduce
+        self.fixed = fixed
+        self.kind = "response"
 
     def __enter__(self):
         global _GLOBAL_DENOMINATOR
-        self.previous, _GLOBAL_DENOMINATOR = _GLOBAL_DENOMINATOR, self.reduce
+        self.previous, _GLOBAL_DENOMINATOR = _GLOBAL_DENOMINATOR, self
         return self
 
     def __exit__(self, *exc):
@@ -1062,9 +1076,24 @@ class global_loss_denominator:
         _GLOBAL_DENOMINATOR = self.previous
         return False
 
+    @contextmanager
+    def select(self, kind):
+        if self.fixed is not None and kind not in self.fixed:
+            raise KeyError(f"no global loss denominator for mask kind {kind!r}")
+        previous, self.kind = self.kind, kind
+        try:
+            yield self
+        finally:
+            self.kind = previous
 
-def _global_masked_mean(values, mask):
-    denominator = _GLOBAL_DENOMINATOR(mask.sum().detach())
+    def __call__(self, local, unit="tokens"):
+        if self.fixed is None:
+            return self.reduce(local)
+        return torch.as_tensor(float(self.fixed[self.kind][unit]), dtype=torch.float32, device=local.device)
+
+
+def _global_masked_mean(values, mask, unit="tokens"):
+    denominator = _GLOBAL_DENOMINATOR(mask.sum().detach(), unit)
     return verl_F.masked_sum(values, mask) / (denominator + 1e-8)
 
 
@@ -1088,11 +1117,11 @@ def agg_loss(loss_mat: torch.Tensor, loss_mask: torch.Tensor, loss_agg_mode: str
             return _global_masked_mean(loss_mat, loss_mask)
         if loss_agg_mode == "seq-mean-token-sum":
             seq_losses = torch.sum(loss_mat * loss_mask, dim=-1)
-            return _global_masked_mean(seq_losses, (torch.sum(loss_mask, dim=-1) > 0).float())
+            return _global_masked_mean(seq_losses, (torch.sum(loss_mask, dim=-1) > 0).float(), "seqs")
         if loss_agg_mode == "seq-mean-token-mean":
             counts = torch.sum(loss_mask, dim=-1)
             seq_losses = torch.sum(loss_mat * loss_mask, dim=-1) / (counts + 1e-8)
-            return _global_masked_mean(seq_losses, (counts > 0).float())
+            return _global_masked_mean(seq_losses, (counts > 0).float(), "seqs")
         # seq-mean-token-sum-norm has a fixed divisor; local sums already add up.
     if loss_agg_mode == "token-mean":
         loss = verl_F.masked_mean(loss_mat, loss_mask)

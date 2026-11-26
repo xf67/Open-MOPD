@@ -826,7 +826,13 @@ class DataParallelPPOActor(BasePPOActor):
             rm_scores = -kl_val * norm_weights
             res_tensors["union_top_k_ids"] = T_ids
             
-        elif strategy == "intersection":
+        elif strategy in ("intersection", "top_p_intersec", "top-p-intersec"):
+            # top_p_intersec: overlap_mask = student top-k id inside the teacher's top-p
+            # nucleus (_compute_student_topk_in_teacher_top_p_mask). The released MT-OPD
+            # reward has no branch for it; this is the intersection formula on that mask,
+            # as the released Direct-OPD/ExOPD rewards do for top_p_intersec.
+            if overlap_mask is None:
+                raise ValueError(f"top_k_strategy={strategy} requires the teacher overlap_mask")
             valid_mask = overlap_mask.bool()
             kl_val = S_logp - T_on_S
             kl_val = torch.where(valid_mask, kl_val, torch.zeros_like(kl_val))
@@ -1071,6 +1077,40 @@ class DataParallelPPOActor(BasePPOActor):
 
         return log_probs, entropys, topk_ids_tensor, topk_log_probs_tensor
 
+    def _large_batch_microbatches(self, mini_batch: DataProto, budget: int):
+        """Token-budget micro-batches of one mini-batch plus its global loss denominators.
+
+        Returns (micro-batches, fixed counts for global_loss_denominator, per micro-batch
+        (prompt, response) widths for column compaction). The counts are summed over all
+        micro-batches of this mini-batch and over all CPU-DP ranks: one gloo all-reduce.
+        """
+        from verl.utils.large_batch import split_by_budget, valid_lengths
+
+        batch = mini_batch.batch
+        response_width = batch["responses"].shape[1]
+        prompt_lengths, response_lengths = valid_lengths(batch["attention_mask"], response_width)
+        groups = split_by_budget(prompt_lengths, response_lengths, budget, padded=False)
+        micro_batches, widths = [], []
+        for rows in groups:
+            micro_batches.append(mini_batch.slice(rows[0], rows[-1] + 1))
+            widths.append((max(prompt_lengths[r] for r in rows), max(response_lengths[r] for r in rows)))
+        response_mask = batch["response_mask"].float()
+        pg_mask = response_mask
+        if "format_mask" in batch.keys():
+            pg_mask = response_mask * batch["format_mask"].float().unsqueeze(-1)
+        local = torch.stack([
+            response_mask.sum(), (response_mask.sum(-1) > 0).float().sum(),
+            pg_mask.sum(), (pg_mask.sum(-1) > 0).float().sum(),
+        ]).detach().to("cpu", torch.float64)
+        if torch.distributed.is_initialized() and torch.distributed.get_world_size() > 1:
+            torch.distributed.all_reduce(local)  # gloo (CPU tensor), never NCCL
+        values = local.tolist()
+        counts = {
+            "response": {"tokens": values[0], "seqs": values[1]},
+            "pg": {"tokens": values[2], "seqs": values[3]},
+        }
+        return micro_batches, counts, widths
+
     @GPUMemoryLogger(role="dp actor", logger=logger)
     def update_policy(self, data: DataProto):
         # make sure we are in training mode
@@ -1124,6 +1164,11 @@ class DataParallelPPOActor(BasePPOActor):
         if "student_top_k_ids" in data.batch.keys():
             select_keys.append("student_top_k_ids")
 
+        # top_p_intersec: the routed teacher's nucleus mask over the student top-k ids
+        # (fixed at scoring time), needed to refresh the reward.
+        if "overlap_mask" in data.batch.keys():
+            select_keys.append("overlap_mask")
+
         # Include union_top_k_ids/log_probs for union strategy
         if "union_top_k_ids" in data.batch.keys():
             print("Now we are using union strategy, get union_top_k_ids")
@@ -1147,19 +1192,28 @@ class DataParallelPPOActor(BasePPOActor):
         # Split to make minibatch iterator for updating the actor
         # See PPO paper for details. https://arxiv.org/abs/1707.06347
         pipeline = data.meta_info.get("opd_pipeline", False)
+        # Large-batch mode: several mini-batches (one synchronous update each) and several
+        # token-budget micro-batches per mini-batch, accumulated in FP32 on the host.
+        large_batch = bool(getattr(self.actor_optimizer, "accumulate", False))
         token_batch = data.meta_info.get("pipeline_token_batch", False)
         if token_batch and (not pipeline or self.config.use_dynamic_bsz):
             raise ValueError("token batching requires one intact pipeline training batch")
         mini_batch_size = len(data) if token_batch else self.config.ppo_mini_batch_size
         micro_batch_size = len(data) if token_batch else self.config.ppo_micro_batch_size_per_gpu
         mini_batches = data.split(mini_batch_size)
-        if pipeline and (len(mini_batches) != 1 or self.config.ppo_epochs != 1):
+        if large_batch:
+            if self.config.use_dynamic_bsz or token_batch or self.config.ppo_epochs != 1:
+                raise ValueError("large_batch uses its own token-budget micro-batches and ppo_epochs=1")
+            if len(data) % mini_batch_size != 0:
+                raise ValueError(f"large_batch: rank batch {len(data)} is not a multiple of {mini_batch_size}")
+            train_token_budget = int(data.meta_info.get("train_token_budget", 24576))
+        if pipeline and not large_batch and (len(mini_batches) != 1 or self.config.ppo_epochs != 1):
             raise ValueError("CPU OPD pipeline requires exactly one optimizer step per batch")
-        if pipeline and self.actor_optimizer.gradient_offload and (
+        if pipeline and not large_batch and self.actor_optimizer.gradient_offload and (
             self.config.use_dynamic_bsz or micro_batch_size < len(data)
         ):
             raise ValueError("early gradient offload requires one fixed training micro-batch per step")
-        on_policy = len(mini_batches) == 1 and self.config.ppo_epochs == 1 and not pipeline
+        on_policy = len(mini_batches) == 1 and self.config.ppo_epochs == 1 and not pipeline and not large_batch
 
         # CPU data parallel: the ranks' gradients are summed on CPU, so each rank's loss
         # must be its share of the global objective. With one micro-batch per mini-batch
@@ -1168,14 +1222,24 @@ class DataParallelPPOActor(BasePPOActor):
         cpu_dp_world = 1
         if getattr(self.actor_optimizer, "global_step_decision", False):
             cpu_dp_world = torch.distributed.get_world_size()
-        cpu_dp_exact = cpu_dp_world > 1 and not self.config.use_dynamic_bsz and micro_batch_size >= mini_batch_size
-        if cpu_dp_world > 1 and not cpu_dp_exact:
+        cpu_dp_exact = (
+            cpu_dp_world > 1 and not large_batch and not self.config.use_dynamic_bsz
+            and micro_batch_size >= mini_batch_size
+        )
+        if cpu_dp_world > 1 and not cpu_dp_exact and not large_batch:
             logger.warning("CPU data parallel with several micro-batches per mini-batch: averaging rank losses")
 
         metrics = {}
         for _ in range(self.config.ppo_epochs):
             for batch_idx, mini_batch in enumerate(mini_batches):
-                if self.config.use_dynamic_bsz:
+                large_counts = None
+                if large_batch:
+                    micro_batches, large_counts, mb_lengths = self._large_batch_microbatches(
+                        mini_batch, train_token_budget
+                    )
+                    pg_loss_share = 0.0
+                    minibatch_metric_lists = {}
+                elif self.config.use_dynamic_bsz:
                     max_token_len = self.config.ppo_max_token_len_per_gpu * self.ulysses_sequence_parallel_size
                     micro_batches, _ = prepare_dynamic_batch(mini_batch, max_token_len=max_token_len)
                 else:
@@ -1186,10 +1250,20 @@ class DataParallelPPOActor(BasePPOActor):
 
                 self.actor_optimizer.zero_grad()
 
-                for micro_batch in micro_batches:
+                for mb_index, micro_batch in enumerate(micro_batches):
                     micro_batch = micro_batch.to(get_device_id())
                     micro_batch_metrics = {}
                     model_inputs = {**micro_batch.batch, **micro_batch.non_tensor_batch}
+                    if large_batch:
+                        from verl.utils.large_batch import compact_columns
+
+                        model_inputs = compact_columns(
+                            model_inputs, model_inputs["responses"].shape[1], *mb_lengths[mb_index]
+                        )
+                        for key in ("student_top_k_ids", "union_top_k_ids"):
+                            if key in model_inputs and model_inputs[key].dtype != torch.long:
+                                model_inputs[key] = model_inputs[key].long()
+                        self.actor_optimizer.begin_microbatch()
                     response_mask = model_inputs["response_mask"]
                     old_log_prob = model_inputs["old_log_probs"]
                     advantages = model_inputs["advantages"]
@@ -1213,7 +1287,9 @@ class DataParallelPPOActor(BasePPOActor):
                     entropy_coeff = self.config.entropy_coeff
                     loss_agg_mode = self.config.loss_agg_mode
 
-                    if self.config.use_dynamic_bsz:
+                    if large_batch:
+                        loss_scale_factor = 1.0  # the fixed global denominators normalize the mini-batch
+                    elif self.config.use_dynamic_bsz:
                         loss_scale_factor = response_mask.shape[0] / mini_batch_size
                     else:
                         loss_scale_factor = 1 / self.gradient_accumulation
@@ -1262,6 +1338,7 @@ class DataParallelPPOActor(BasePPOActor):
                                 ],
                                 response_mask=response_mask,
                                 reward_weight_mode=self._opd_reward_weight_mode,
+                                valid_mask=model_inputs.get("overlap_mask", None),
                             )
                             micro_batch_metrics["mt_opd/m4_advantage_refreshed"] = 1.0
 
@@ -1272,9 +1349,13 @@ class DataParallelPPOActor(BasePPOActor):
                             )
                         log_prob_for_loss = log_prob
 
-                    with _actor_update_nvtx("loss"), (
-                        global_loss_denominator(_cpu_dp_allreduce) if cpu_dp_exact else nullcontext()
-                    ):
+                    if large_batch:
+                        denominator_ctx = global_loss_denominator(fixed=large_counts)
+                    elif cpu_dp_exact:
+                        denominator_ctx = global_loss_denominator(_cpu_dp_allreduce)
+                    else:
+                        denominator_ctx = nullcontext()
+                    with _actor_update_nvtx("loss"), denominator_ctx as denominator:
                         # MT-OPD M1: rebalance each domain's share of the gradient. Applied
                         # here, after M4, so a refreshed advantage still carries the domain
                         # weighting.
@@ -1302,7 +1383,7 @@ class DataParallelPPOActor(BasePPOActor):
                         if hasattr(self.config, "use_rollout_log_probs") and self.config.use_rollout_log_probs:
                             old_log_prob = model_inputs["old_log_probs"]
                         else:
-                            if on_policy or pipeline:
+                            if on_policy or (pipeline and not large_batch):
                                 print("pipeline_current_signal" if pipeline else "on_policy")
                                 # Pipeline OPD refreshes the current-student signal
                                 # on a fixed old support; it does not apply a PPO
@@ -1341,16 +1422,17 @@ class DataParallelPPOActor(BasePPOActor):
                         policy_loss_fn = get_policy_loss_fn(loss_mode)
 
                         # Compute policy loss (any function is expected to return 2 values)
-                        pg_loss, pg_metrics = policy_loss_fn(
-                            old_log_prob=old_log_prob,
-                            log_prob=log_prob_for_loss,  # 3D for top-k, 2D otherwise
-                            advantages=advantages,
-                            response_mask=response_mask,
-                            loss_agg_mode=loss_agg_mode,
-                            config=self.config,
-                            rollout_is_weights=rollout_is_weights,
-                            format_mask=format_mask,
-                        )
+                        with (denominator.select("pg") if large_batch else nullcontext()):
+                            pg_loss, pg_metrics = policy_loss_fn(
+                                old_log_prob=old_log_prob,
+                                log_prob=log_prob_for_loss,  # 3D for top-k, 2D otherwise
+                                advantages=advantages,
+                                response_mask=response_mask,
+                                loss_agg_mode=loss_agg_mode,
+                                config=self.config,
+                                rollout_is_weights=rollout_is_weights,
+                                format_mask=format_mask,
+                            )
                         micro_batch_metrics.update(pg_metrics)
 
                         if entropy_coeff != 0:
@@ -1385,14 +1467,34 @@ class DataParallelPPOActor(BasePPOActor):
                     with _actor_update_nvtx("backward"):
                         loss.backward()
 
-                    # Under the global denominator pg_loss is this rank's share; x world estimates the global mean.
-                    micro_batch_metrics["actor/pg_loss"] = (
-                        pg_loss.detach().item() * loss_scale_factor * (cpu_dp_world if cpu_dp_exact else 1)
-                    )
-                    append_to_dict(metrics, micro_batch_metrics)
+                    if large_batch:
+                        # This micro-batch's share of the global mini-batch mean; summed below.
+                        pg_loss_share += pg_loss.detach().item()
+                        # Ranks run different numbers of micro-batches: average within the
+                        # mini-batch so every rank reports one value per update (no ragged lists).
+                        append_to_dict(minibatch_metric_lists, micro_batch_metrics)
+                    else:
+                        # Under the global denominator pg_loss is this rank's share; x world estimates the global mean.
+                        micro_batch_metrics["actor/pg_loss"] = (
+                            pg_loss.detach().item() * loss_scale_factor * (cpu_dp_world if cpu_dp_exact else 1)
+                        )
+                        append_to_dict(metrics, micro_batch_metrics)
 
                 grad_norm = self._optimizer_step()
-                mini_batch_metrics = {"actor/grad_norm": grad_norm.detach().item()}
+                if large_batch:
+                    pg_global = torch.tensor([pg_loss_share], dtype=torch.float64)
+                    if torch.distributed.is_initialized() and torch.distributed.get_world_size() > 1:
+                        torch.distributed.all_reduce(pg_global)  # gloo, once per mini-batch
+                    optimizer_metrics = getattr(self.actor_optimizer, "last_metrics", {})
+                    mini_batch_metrics = {
+                        **{key: float(sum(values) / len(values)) for key, values in minibatch_metric_lists.items()},
+                        "actor/pg_loss": float(pg_global.item()),
+                        "actor/grad_norm": float(optimizer_metrics.get("cpu_dp/global_grad_norm", grad_norm.item())),
+                        "actor/grad_norm_local": grad_norm.detach().item(),
+                        "actor/microbatches_per_update": float(len(micro_batches)),
+                    }
+                else:
+                    mini_batch_metrics = {"actor/grad_norm": grad_norm.detach().item()}
                 append_to_dict(metrics, mini_batch_metrics)
         self.actor_optimizer.zero_grad()
         return metrics
